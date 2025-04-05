@@ -1,0 +1,33 @@
+# Core ML libraries
+numpy
+scipy
+scikit-learn
+pandas
+
+# Deep Learning (GPU-enabled)
+torch
+torchvision
+torchaudio
+
+# Data visualization
+matplotlib
+seaborn
+pillow  # for image handling
+
+# Jupyter & interactive tools
+jupyterlab
+notebook
+ipywidgets
+
+# Data preprocessing and utilities
+tqdm
+scikit-image
+pydantic
+joblib
+
+# Optional: for working with Hugging Face models or datasets
+transformers
+datasets
+
+# Optional: for working with kernel compliation and optimization
+ninja
