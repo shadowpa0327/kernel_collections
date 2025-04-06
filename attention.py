@@ -190,7 +190,7 @@ def group_query_attention_fa(
     return flash_attn_with_kvcache(query, key, value, causal=True)
 
 @torch.inference_mode()
-def group_query_attention_factorized(
+def group_query_attention_factorized_v_only(
     query,
     key,
     value_A,  # Factorized value component A: (bsz, kv_len, rank)
@@ -245,11 +245,10 @@ def group_query_attention_factorized(
 
     # Compute group size: how many Q-heads attend per KV-head
     group_size = num_heads // num_kv_heads
-
+    assert q_len == 1, "q_len must be 1"
     # 1) Reshape Q to split out group dimension:
-    #    (bsz, num_heads, q_len, head_dim)
-    # -> (bsz, num_kv_heads, group_size, q_len, head_dim)
-    query = query.view(bsz, num_kv_heads, group_size, head_dim).contiguous()
+    # -> (bsz, num_kv_heads, group_size, q_len*group_size, head_dim)
+    query = query.view(bsz, num_kv_heads, q_len*group_size, head_dim).contiguous()
 
     # 2) We will do a scaled dot-product within each group:
     #    => each group of Q-heads corresponds to exactly one KV-head index.
@@ -302,27 +301,85 @@ def group_query_attention_factorized(
 
     return attn_output
 
-# -----------------------------
-# Example usage / quick test
-# -----------------------------
-if __name__ == "__main__":
-    bsz = 1
-    num_heads = 32
-    num_kv_heads = 8
-    q_len = 1
-    kv_len = 8192
-    head_dim = 8
-
-    # Create random tensors for Q, K, V
-    q = torch.randn(bsz, num_heads,  q_len, head_dim).half().cuda()
-    k = torch.randn(bsz, num_kv_heads, kv_len, head_dim).half().cuda()
-    v = torch.randn(bsz, num_kv_heads, kv_len, head_dim).half().cuda()
-    causal_mask = torch.tril(torch.ones(q_len, kv_len, device="cuda"))
-    output = group_query_attention(q, k, v)
-    outputv2 = group_query_attentionv2(q, k, v)
-    output_fa = group_query_attention_fa(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
-    print(torch.max(torch.abs(output_fa[0]-output[0])))
-    print(torch.allclose(output, outputv2, atol=1e-3, rtol=1e-3))
-    print(torch.allclose(output, output_fa, atol=1e-2, rtol=1e-2))
-    print("Output shape: ", output.shape)   # Expect: (bsz, num_heads, q_len, head_dim)
-    # print("Weights shape:", weights.shape)  # Expect: (bsz, num_heads, q_len, kv_len)
+def group_query_attention_factorized(
+    query,                  # (bsz, num_heads, q_len, head_dim)
+    key_A,                  # (bsz, kv_len, k_rank)
+    key_B,                  # (bsz, num_kv_heads, k_rank, head_dim)
+    value_A,                # (bsz, kv_len, v_rank)
+    value_B,                # (bsz, num_kv_heads, v_rank, head_dim)
+    attn_mask=None,         # (q_len, kv_len) or (bsz, num_heads, q_len, kv_len)
+    dropout_p=0.0,          # dropout probability
+):
+    """
+    Factorized version of group query attention where both K and V are factorized.
+    K = key_A @ key_B and V = value_A @ value_B
+    
+    Supports different ranks for K and V factorizations.
+    """
+    # Get dimensions
+    bsz, num_heads, q_len, head_dim = query.shape
+    _, kv_len, k_rank = key_A.shape
+    _, num_kv_heads, k_rank2, _ = key_B.shape
+    _, _, v_rank = value_A.shape
+    _, _, v_rank2, _ = value_B.shape
+    
+    # Validate dimensions
+    assert k_rank == k_rank2, "Rank mismatch between key_A and key_B"
+    assert v_rank == v_rank2, "Rank mismatch between value_A and value_B"
+    
+    # Ensure num_heads is divisible by num_kv_heads
+    assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
+    group_size = num_heads // num_kv_heads # how many Q-heads attend per KV-head
+    assert q_len == 1, "q_len must be 1"
+    
+    # Reshape query to group the heads
+    # (bsz, num_heads, q_len, head_dim) -> (bsz, num_kv_heads, group_size*q_len, head_dim)
+    query = query.view(bsz, num_kv_heads, group_size*q_len, head_dim)
+    
+    # 3) Compute attention weights = Q * K^T / sqrt(head_dim)
+    with record_function("q@K"):
+        # Compute Q @ key_B^T -> (bsz, num_kv_heads, group_size*q_len, k_rank)
+        latents = torch.matmul(query, key_B.transpose(-1, -2))
+        latents = latents.view(bsz, -1, k_rank) # (bsz, num_heads*q_len, k_rank)
+        
+        # Compute latents @ key_A^T -> (bsz, num_heads*q_len, kv_len)
+        attn_weights = torch.matmul(latents, key_A.transpose(-1, -2))
+        attn_weights = attn_weights.reshape(bsz, num_heads, q_len, kv_len)
+        
+        # Scale attention weights
+        attn_weights = attn_weights / (head_dim ** 0.5)
+    
+    # 4) Optionally apply an attention mask
+    if attn_mask is not None:
+        attn_weights = attn_weights + attn_mask
+    
+    # 5) Softmax over kv_len dimension
+    with torch.autograd.profiler.record_function("softmax"):
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    
+    # 6) (Optional) apply dropout
+    if dropout_p > 0.0:
+        attn_weights = torch.nn.functional.dropout(attn_weights, p=dropout_p, training=True)
+    
+    # 7) Compute attention output
+    with torch.autograd.profiler.record_function("attn_weights@V"):
+        # Factorized computation:
+        # First reshape attention weights to (bsz, num_heads*q_len, kv_len)
+        # for easier matrix multiplication with value_A
+        attn_score = attn_weights.view(bsz, num_heads*q_len, kv_len)
+        
+        # Compute: attn_score @ value_A
+        # (bsz, num_heads*q_len, kv_len) @ (bsz, kv_len, v_rank) -> (bsz, num_heads*q_len, v_rank)
+        temp = torch.matmul(attn_score, value_A)
+        # Reshape to (bsz, num_kv_heads, group_size*q_len, v_rank)
+        temp = temp.view(bsz, num_kv_heads, group_size*q_len, v_rank)
+        
+        # Compute: temp @ value_B
+        # (bsz, num_kv_heads, group_size*q_len, v_rank) @ (bsz, num_kv_heads, v_rank, head_dim)
+        # -> (bsz, num_kv_heads, group_size*q_len, head_dim)
+        attn_output = torch.matmul(temp, value_B)
+    
+    # 8) Reshape back to (bsz, num_heads, q_len, head_dim)
+    attn_output = attn_output.view(bsz, num_heads, q_len, head_dim)
+    
+    return attn_output
