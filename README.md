@@ -18,4 +18,4 @@ python -m pip install -r requirements.txt
 
 ## Fused Key Reconstruction
 + `test_fused_key_reconstruction.py` contains the implementation of the fused key reconstruction.
-    + `_qAB_fwd` is the forward pass of the fused key reconstruction.
+    + `_qAB_fwd` Triton implementation for fusing key reconstruction with multiplication with query. (RoPE hasn't been applied yet)`
