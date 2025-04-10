@@ -81,7 +81,6 @@ def _fwd_grouped_kernel_stage1(
     cur_head_id = tl.program_id(1)
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
     split_kv_id = tl.program_id(2)
-
     if BLOCK_H < kv_group_num:
         VALID_BLOCK_H: tl.constexpr = BLOCK_H
     else:
@@ -219,8 +218,8 @@ def _decode_grouped_att_m_fwd(
     q,
     k_buffer,
     v_buffer,
-    att_out,
-    att_lse,
+    attn_out,
+    attn_lse,
     num_kv_splits,
     max_kv_splits,
     sm_scale,
@@ -244,7 +243,6 @@ def _decode_grouped_att_m_fwd(
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[2]
     kv_seq_len = k_buffer.shape[1]
-
     BLOCK_H = 32
     MAX_KV_SPLITS = max_kv_splits
     grid = (
@@ -261,8 +259,8 @@ def _decode_grouped_att_m_fwd(
         k_buffer,
         v_buffer,
         sm_scale,
-        att_out,
-        att_lse,
+        attn_out,
+        attn_lse,
         num_kv_splits,
         q.stride(0),
         q.stride(1),
@@ -272,9 +270,9 @@ def _decode_grouped_att_m_fwd(
         v_buffer.stride(0),
         v_buffer.stride(1),
         v_buffer.stride(2),
-        att_out.stride(0),
-        att_out.stride(1),
-        att_out.stride(2),
+        attn_out.stride(0),
+        attn_out.stride(1),
+        attn_out.stride(2),
         kv_group_num=kv_group_num,
         q_head_num=head_num,
         kv_seq_len=kv_seq_len,
@@ -371,7 +369,6 @@ def _decode_softmax_reducev_fwd(
     MAX_KV_SPLITS = max_kv_splits
 
     extra_kargs = {}
-
     grid = (batch, head_num)
     _fwd_kernel_stage2[grid](
         attn_logits,
@@ -393,21 +390,38 @@ def _decode_softmax_reducev_fwd(
         **extra_kargs,
     )
 
-def decode_attention_fwd_grouped(
-    q,
-    k_buffer,
-    v_buffer,
-    o,
-    attn_logits,
-    attn_lse,
-    num_kv_splits,
-    max_kv_splits,
-    sm_scale,
-    logit_cap=0.0,
+def decode_attention_fwd(
+    q,                  # shape: [batch, num_q_heads, head_dim]
+    k_buffer,           # shape: [batch, kv_len, num_kv_heads, head_dim]
+    v_buffer,           # shape: [batch, kv_len, num_kv_heads, head_dim]
+    o,                  # shape: [batch, num_q_heads, head_dim]
+    sm_scale=1.0,       # float: softmax scaling factor
+    logit_cap=0.0,      # float: cap for logits
 ):
+    batch, num_q_heads, head_dim = q.shape
+    _, kv_len, num_kv_heads, _ = k_buffer.shape
     
-    assert max_kv_splits == attn_logits.shape[2]
-    assert q.shape[0] <= attn_logits.shape[0]
+    # Calculate kv_group_num (ratio of query heads to key/value heads)
+    kv_group_num = num_q_heads // num_kv_heads
+    assert kv_group_num >= 1
+    
+    # Determine number of KV splits if not provided
+    # FIXME(brian1009): Determine the optimal number of KV splits on the fly
+    num_kv_splits = torch.ones(batch, dtype=torch.int32, device=q.device) * 128
+    max_kv_splits = 128
+
+    # Create intermediate tensors for attention computation
+    attn_logits = torch.empty(
+        (batch, num_q_heads, max_kv_splits, head_dim),
+        dtype=q.dtype, 
+        device=q.device
+    )
+    
+    attn_lse = torch.empty(
+        (batch, num_q_heads, max_kv_splits),
+        dtype=torch.float32,
+        device=q.device
+    )
 
     _decode_grouped_att_m_fwd(
         q,
@@ -420,6 +434,7 @@ def decode_attention_fwd_grouped(
         sm_scale,
         logit_cap,
     )
+    
     _decode_softmax_reducev_fwd(
         attn_logits,
         attn_lse,
@@ -430,47 +445,19 @@ def decode_attention_fwd_grouped(
         max_kv_splits,
     )
 
-
-def decode_attention_fwd(
-    q,
-    k_buffer,
-    v_buffer,
-    o,
-    attn_logits,
-    attn_lse,
-    num_kv_splits,
-    max_kv_splits,
-    sm_scale,
-    logit_cap=0.0,
+def decode_attention_reference(
+    q,                  # shape: [batch, num_q_heads, head_dim]
+    k_buffer,           # shape: [batch, kv_len, num_kv_heads, head_dim]
+    v_buffer,           # shape: [batch, kv_len, num_kv_heads, head_dim]
+    o,                  # shape: [batch, num_q_heads, head_dim]
+    sm_scale,           # float: softmax scaling factor
 ):
-    assert max_kv_splits == attn_logits.shape[2]
-    assert q.shape[0] <= attn_logits.shape[0]
-
-    kv_group_num = q.shape[1] // v_buffer.shape[2]
-    assert kv_group_num >= 1
-
-    # GQA/MQA/MLA
-    decode_attention_fwd_grouped(
-        q,
-        k_buffer,
-        v_buffer,
-        o,
-        attn_logits,
-        attn_lse,
-        num_kv_splits,
-        max_kv_splits,
-        sm_scale,
-        logit_cap,
-    )
-
-
-def decode_attention_reference(q, k_buffer, v_buffer, o, sm_scale):
     # Step 1: Store the size 
     batch, num_q_heads, head_dim = q.shape
     batch, kv_len, num_kv_heads, head_dim = k_buffer.shape
     
     num_q_heads_per_kv_group = num_q_heads // num_kv_heads
-    assert batch== 1
+    #assert batch== 1
     #k_buffer = k_buffer.unsqueeze(0) # [batch, kv_len, num_kv_heads, head_dim]
     k_buffer = k_buffer.transpose(1, 2) # [batch, num_kv_heads, kv_len, head_dim]
     
@@ -480,7 +467,7 @@ def decode_attention_reference(q, k_buffer, v_buffer, o, sm_scale):
     q = q.view(batch, num_kv_heads, num_q_heads_per_kv_group, head_dim)
 
     # Step 2: Compute q@K
-    qk = torch.matmul(q, k_buffer.transpose(-1, -2))
+    qk = torch.matmul(q, k_buffer.transpose(-1, -2))  # [batch, num_kv_heads, num_q_heads_per_kv_group, kv_len]
     # Step 3: Compute softmax
     qk = qk / sm_scale
     qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32).to(qk.dtype)  # [batch, num_kv_heads, num_q_heads_per_kv_group, kv_len]
@@ -488,172 +475,3 @@ def decode_attention_reference(q, k_buffer, v_buffer, o, sm_scale):
     o = torch.matmul(qk, v_buffer) # [batch, num_kv_heads, num_q_heads_per_kv_group, head_dim]
     o = o.view(batch, num_q_heads, head_dim)
     return o
-
-if __name__ == "__main__":
-   # ---------------------------
-    # 1) BASIC PARAMETERS
-    # ---------------------------
-    batch       = 1
-    q_len       = 1
-    kv_len      = 256*1024
-    num_q_heads = 32
-    num_kv_heads = 1
-    head_dim    = 384
-    sm_scale    = 1.0
-
-    # Create random Q, K, V, O with the shapes you specified.
-    # Here we assume you want them on CUDA, half-precision (float16):
-    dtype = torch.float16
-    device = 'cuda'
-
-    # q:  (q_len, num_q_heads, head_dim) --> reshape to (batch, num_q_heads, head_dim)
-    q = torch.randn(batch, q_len*num_q_heads, head_dim, dtype=dtype, device=device) # shape: (1, 32, 128)
-
-    # k_buffer, v_buffer: (kv_len, num_kv_heads, head_dim)
-    k_buffer = torch.randn(batch, kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
-    v_buffer = torch.randn(batch, kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
-
-    # o:  (q_len, num_q_heads, head_dim) or similarly (batch, heads, head_dim)
-    o = torch.zeros_like(q)
-
-    # ---------------------------
-    # 2) CREATE kv_indptr, kv_indices
-    # ---------------------------
-    # Since batch=1, we only need to say that:
-    #   - kv_indptr[0] = 0
-    #   - kv_indptr[1] = kv_len (4096)
-    #
-    # This means the entire [0..4096) range of kv_indices belongs to batch 0.
-    #kv_indptr = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
-
-    # kv_indices will be a simple range [0..4096).
-    # kv_indices = torch.arange(kv_len, dtype=torch.int32, device=device)
-
-    # ---------------------------
-    # 3) DEFINE THE "SPLITS" AND INTERMEDIATE BUFFERS
-    # ---------------------------
-    # Suppose we do 1 KV-split for this entire chunk.
-    num_kv_splits = torch.tensor([128], dtype=torch.int32, device=device)
-    max_kv_splits = 128
-
-    # If your kernel is using "attn_logits" to store partial results per split,
-    # you typically want shape = (batch, num_q_heads, max_kv_splits, head_dim_of_V).
-    # Here head_dim_of_V = 128, same as K, so:
-    attn_logits = torch.zeros(
-        (batch, num_q_heads, max_kv_splits, head_dim),
-        dtype=dtype,
-        device=device,
-    )
-
-    # Likewise for log-sum-exp array, shape = (batch, num_q_heads, max_kv_splits)
-    attn_lse = torch.zeros(
-        (batch, num_q_heads, max_kv_splits),
-        dtype=dtype,
-        device=device,
-    )
-
-    # Example usage:
-    decode_attention_fwd(
-        q, 
-        k_buffer, 
-        v_buffer, 
-        o,
-        attn_logits,
-        attn_lse,
-        num_kv_splits,
-        max_kv_splits,
-        sm_scale,
-        logit_cap=0.0,
-    )
-
-    # Now 'o' would contain the final result after "attention" (in real code).
-    print("o shape:", o.shape)            # Should be [1, 32, 128]
-    print("attn_logits shape:", attn_logits.shape)  # [1, 32, 1, 128]
-    print("attn_lse shape:", attn_lse.shape)        # [1, 32, 1]
-
-    o_ref = decode_attention_reference(q, k_buffer, v_buffer, o, sm_scale)
-    print(torch.max(torch.abs(o_ref-o)))
-    print("Ouput aligned with reference:", torch.allclose(o, o_ref, atol=5e-2, rtol=5e-2))
-
-    # Test performance
-    import time
-    
-    # Warm-up runs
-    for _ in range(10):
-        decode_attention_fwd(
-            q, 
-            k_buffer, 
-            k_buffer, 
-            o,
-            attn_logits,
-            attn_lse,
-            num_kv_splits,
-            max_kv_splits,
-            sm_scale,
-            logit_cap=0.0,
-        )
-    
-    # Measure time for triton implementation
-    torch.cuda.synchronize()
-    start_time = time.time()
-    num_runs = 100
-    
-    for _ in range(num_runs):
-        decode_attention_fwd(
-            q, 
-            k_buffer, 
-            k_buffer, 
-            o,
-            attn_logits,
-            attn_lse,
-            num_kv_splits,
-            max_kv_splits,
-            sm_scale,
-            logit_cap=0.0,
-        )
-    
-    torch.cuda.synchronize()
-    triton_time = (time.time() - start_time) / num_runs
-    print(f"Triton implementation average time: {triton_time*1000:.4f} ms")
-    
-    # Measure time for reference implementation
-    torch.cuda.synchronize()
-    start_time = time.time()
-    
-    for _ in range(num_runs):
-        decode_attention_reference(
-            q, 
-            k_buffer, 
-            v_buffer, 
-            o,
-            sm_scale,
-        )
-    
-    torch.cuda.synchronize()
-    reference_time = (time.time() - start_time) / num_runs
-    print(f"Reference implementation average time: {reference_time*1000:.4f} ms")
-    print(f"Speedup: {reference_time/triton_time:.2f}x")
-    
-    
-    # # flash attention
-    # from flash_attn import flash_attn_with_kvcache
-    
-    # q = q.reshape(batch, 1, num_q_heads, head_dim)
-    # k_buffer = k_buffer.reshape(batch, kv_len, num_kv_heads, head_dim)
-    # v_buffer = v_buffer.reshape(batch, kv_len, num_kv_heads, head_dim)
-    
-    # print("flash attention")
-    # # Warm-up runs
-    # for _ in range(10):
-    #     flash_attn_with_kvcache(q, k_buffer, v_buffer)
-    
-    # # Measure time for triton implementation
-    # torch.cuda.synchronize()
-    # start_time = time.time()
-    # num_runs = 100
-    # for _ in range(num_runs):
-    #     flash_attn_with_kvcache(q, k_buffer, v_buffer)
-    # torch.cuda.synchronize()
-    # flash_time = (time.time() - start_time) / num_runs
-    # print(f"Flash attention average time: {flash_time*1000:.4f} ms")
-    # print(f"Speedup over Triton: {triton_time/flash_time:.2f}x")
