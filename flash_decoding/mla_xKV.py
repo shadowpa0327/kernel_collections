@@ -1,5 +1,5 @@
 import torch 
-
+from .mla import _decode_grouped_att_m_fwd, decode_attention_fwd as decode_attention_fwd_triton
 def decode_attention_pd_sep_reference(
     q,                  # shape: [batch, num_q_heads, head_dim]
     k_buffer,           # shape: [batch, num_kv_heads, prefill_kv_len, head_dim]
@@ -178,7 +178,7 @@ def merge_attention_partials_reference(
     
     # Initialize output tensor and denominator
     final_output = torch.zeros((batch, num_q_heads, head_dim), dtype=dtype, device=device)
-    denominator = torch.zeros((batch, num_q_heads), dtype=torch.float32, device=device)
+    denominator = torch.zeros((batch, num_q_heads), dtype=dtype, device=device)
     
     # Merge the partial outputs
     for partial_output, partial_lse in zip(partial_outputs, partial_lses):
@@ -274,13 +274,103 @@ def decode_attention_pd_sep_merged_xKV_reference(
     
     return final_output
 
+
+def decode_attention_pd_sep_merged_xKV_trtion(
+    q,                  # shape: [batch, num_q_heads, head_dim]
+    k_A_buffer,         # shape: [batch, prefill_kv_len, rank]
+    k_B_buffer,         # shape: [batch, num_kv_heads, rank, head_dim]
+    v_A_buffer,         # shape: [batch, prefill_kv_len, rank]
+    v_B_buffer,         # shape: [batch, num_kv_heads, rank, head_dim]
+    k_buffer_decoded,   # shape: [batch, num_kv_heads, decode_kv_len, head_dim]
+    v_buffer_decoded,   # shape: [batch, num_kv_heads, decode_kv_len, head_dim]
+    sm_scale,           # float: softmax scaling factor
+):
+    """
+    Compute attention by separately processing prefill and decode buffers using the xKV approach,
+    then merging the results using the decode_attention_partial_reference and 
+    merge_attention_partials_reference functions.
+    """
+    
+    # Get the shape, num_q_heads, kv_heads etc.
+    batch, num_q_heads, head_dim = q.shape
+    batch, prefill_kv_len, rank = k_A_buffer.shape
+    batch, num_kv_heads, rank, head_dim = k_B_buffer.shape
+    batch, num_kv_heads, decode_kv_len, head_dim = k_buffer_decoded.shape
+    
+    assert num_kv_heads == 1, "num_kv_heads must be 1"
+    q_fused_kB = torch.matmul(q, k_B_buffer.squeeze(1).transpose(-1, -2)) # [batch, num_q_heads, rank]
+    
+    # Reshape k_A_buffer and v_A_buffer to match the expected format for partial attention
+    k_A_reshaped = k_A_buffer.unsqueeze(2)  # [batch, prefill_kv_len, 1, rank]
+    v_A_reshaped = v_A_buffer.unsqueeze(2)  # [batch, prefill_kv_len, 1, rank]
+    
+
+    num_kv_splits = 3
+    prefill_output = torch.empty(
+        (batch, num_q_heads, num_kv_splits, rank),
+        dtype=q.dtype, 
+        device=q.device
+    )
+    prefill_lse = torch.empty(
+        (batch, num_q_heads, num_kv_splits),
+        dtype=torch.float32,
+        device=q.device
+    )
+    # Compute partial attention for prefill buffer
+    _decode_grouped_att_m_fwd(
+        q_fused_kB,
+        k_A_reshaped,
+        v_A_reshaped,
+        prefill_output,
+        prefill_lse,
+        torch.ones(batch, dtype=torch.int32, device=q.device) * num_kv_splits,
+        num_kv_splits,
+        sm_scale,
+        0.0,
+    )
+    
+    # Rescale and apply v_B_buffer
+    prefill_output = prefill_output.transpose(1, 2) # [batch, num_kv_splits, num_q_heads, rank]
+    prefill_output = torch.matmul(prefill_output, v_B_buffer) # [batch, num_kv_splits, num_q_heads, head_dim]
+    prefill_outputs = list(torch.split(prefill_output, 1, dim=1)) # [batch, num_q_heads, head_dim]
+    prefill_outputs = [prefill_output.squeeze(1) for prefill_output in prefill_outputs]
+    # Splitting lse
+    prefill_lse = torch.split(prefill_lse, 1, dim=2)
+    prefill_lse = [prefill_lse.squeeze(-1) for prefill_lse in prefill_lse]
+    # Reshape k_A_buffer and v_A_buffer to match the expected format for partial attention
+    k_A_reshaped = k_A_buffer.unsqueeze(1)  # [batch, 1, prefill_kv_len, rank]
+    v_A_reshaped = v_A_buffer.unsqueeze(1)  # [batch, 1, prefill_kv_len, rank]
+    
+    # Compute partial attention for prefill buffer
+    prefill_output_temp, prefill_lse_temp = decode_attention_partial_reference(
+        q_fused_kB, k_A_reshaped, v_A_reshaped, sm_scale
+    )
+    prefill_output_temp = torch.matmul(prefill_output_temp, v_B_buffer.squeeze(1)) # [batch, num_q_heads, head_dim]
+
+    #breakpoint()
+
+    # Compute partial attention for decode buffer
+    decode_output, decode_lse = decode_attention_partial_reference(
+        q, k_buffer_decoded, v_buffer_decoded, sm_scale
+    )
+
+    # Merge the partial results
+    final_output = merge_attention_partials_reference(
+        prefill_outputs + [decode_output],
+        prefill_lse + [decode_lse]
+    )
+    
+    return final_output
+
+
+
 if __name__ == '__main__':
     # Create random tensors with shapes matching the function signature
-    batch = 2
+    batch = 1
     num_q_heads = 32
     num_kv_heads = 1
     head_dim = 128
-    prefill_kv_len = 512
+    prefill_kv_len = 1024
     decode_kv_len = 128
     rank = 96
 
@@ -288,16 +378,16 @@ if __name__ == '__main__':
     num_q_heads_per_kv_group = num_q_heads // num_kv_heads
     
     # Create random tensors (using uniform [-0.5, 0.5])
-    q = torch.rand(batch, num_q_heads, head_dim, dtype=torch.float32) - 0.5
-    k_A_buffer = torch.rand(batch, prefill_kv_len, rank, dtype=torch.float32) - 0.5
-    k_B_buffer = torch.rand(batch, num_kv_heads, rank, head_dim, dtype=torch.float32) - 0.5
-    v_A_buffer = torch.rand(batch, prefill_kv_len, rank, dtype=torch.float32) - 0.5
-    v_B_buffer = torch.rand(batch, num_kv_heads, rank, head_dim, dtype=torch.float32) - 0.5
-    k_buffer_decoded = torch.rand(batch, num_kv_heads, decode_kv_len, head_dim, dtype=torch.float32) - 0.5
-    v_buffer_decoded = torch.rand(batch, num_kv_heads, decode_kv_len, head_dim, dtype=torch.float32) - 0.5
+    q = (torch.rand(batch, num_q_heads, head_dim, dtype=torch.float32, device='cuda') - 0.5)/3
+    k_A_buffer = (torch.rand(batch, prefill_kv_len, rank, dtype=torch.float32, device='cuda') - 0.5)/3
+    k_B_buffer = (torch.rand(batch, num_kv_heads, rank, head_dim, dtype=torch.float32, device='cuda') - 0.5)/3
+    v_A_buffer = (torch.rand(batch, prefill_kv_len, rank, dtype=torch.float32, device='cuda') - 0.5)/10
+    v_B_buffer = (torch.rand(batch, num_kv_heads, rank, head_dim, dtype=torch.float32, device='cuda') - 0.5)/3
+    k_buffer_decoded = (torch.rand(batch, num_kv_heads, decode_kv_len, head_dim, dtype=torch.float32, device='cuda') - 0.5)/3
+    v_buffer_decoded = (torch.rand(batch, num_kv_heads, decode_kv_len, head_dim, dtype=torch.float32, device='cuda') - 0.5)/3
     k_buffer = torch.matmul(k_A_buffer.unsqueeze(1), k_B_buffer) # [batch, num_kv_heads, prefill_kv_len, head_dim]
     v_buffer = torch.matmul(v_A_buffer.unsqueeze(1), v_B_buffer) # [batch, num_kv_heads, prefill_kv_len, head_dim]
-    sm_scale = float(1.0 / (head_dim ** 0.5))
+    sm_scale = 1.0
     
     print("\n" + "="*80)
     print("TESTING ATTENTION IMPLEMENTATIONS")
@@ -361,9 +451,33 @@ if __name__ == '__main__':
     match_merged_xKV = torch.allclose(result, result_merged_xKV, atol=5e-4, rtol=5e-4)
     print(f"Result matched with TEST 1: {'✓' if match_merged_xKV else '✗'}")
     print(f"Max difference: {torch.max(torch.abs(result - result_merged_xKV))}")
-
-   
     
+    print("\n" + "-"*80)
+    print("TEST 5: decode_attention_pd_sep_merged_xKV_triton (Testing the seperated chunk then merge, under xKV with B matrices fused elsewhere)")
+    print("-"*80)
+    result_merged_xKV_triton = decode_attention_pd_sep_merged_xKV_trtion(
+        q, k_A_buffer, k_B_buffer, v_A_buffer, v_B_buffer, k_buffer_decoded, v_buffer_decoded, sm_scale
+    )
+    print(f"Result shape: {result_merged_xKV_triton.shape}")
+    match_merged_xKV_triton = torch.allclose(result, result_merged_xKV_triton, atol=5e-4, rtol=5e-4)
+    print(f"Result matched with TEST 1: {'✓' if match_merged_xKV_triton else '✗'}")
+    print(f"Max difference: {torch.max(torch.abs(result - result_merged_xKV_triton))}")
+
+    print("\n" + "-"*80)
+    print("TEST 6: decode_attention_fwd_Triton (Testing the full attention)")
+    print("-"*80)
+    o = torch.empty_like(q)
+    print(o.shape)
+    decode_attention_fwd_triton(
+        q, torch.concat([k_buffer, k_buffer_decoded], dim=2).transpose(1, 2), 
+        torch.concat([v_buffer, v_buffer_decoded], dim=2).transpose(1, 2), o, sm_scale
+    )
+    print(o.shape)
+    match_fwd = torch.allclose(result, o, atol=5e-4, rtol=5e-4)
+    print(f"Result matched with TEST 1: {'✓' if match_fwd else '✗'}")
+    print(f"Max difference: {torch.max(torch.abs(result - o))}")
+    
+
     print("\n" + "="*80)
     print("SUMMARY")
     print("="*80)

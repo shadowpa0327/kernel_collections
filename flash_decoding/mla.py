@@ -124,11 +124,6 @@ def _fwd_grouped_kernel_stage1(
             )
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
-            # kv_loc = tl.load(
-            #     kv_indices + cur_batch_kv_start_idx + offs_n,
-            #     mask=offs_n < split_kv_end,
-            #     other=0,
-            # )
             # Load K to K^T
             offs_buf_k = (
                 #kv_loc[None, :] * stride_buf_kbs
@@ -407,13 +402,15 @@ def decode_attention_fwd(
     
     # Determine number of KV splits if not provided
     # FIXME(brian1009): Determine the optimal number of KV splits on the fly
-    num_kv_splits = torch.ones(batch, dtype=torch.int32, device=q.device) * 128
-    max_kv_splits = 128
+    num_kv_splits = torch.ones(batch, dtype=torch.int32, device=q.device) * 130
+    max_kv_splits = 130
+    #num_kv_splits = torch.ones(batch, dtype=torch.int32, device=q.device) * 1
+    #max_kv_splits = 1
 
     # Create intermediate tensors for attention computation
     attn_logits = torch.empty(
         (batch, num_q_heads, max_kv_splits, head_dim),
-        dtype=q.dtype, 
+        dtype=torch.float32, 
         device=q.device
     )
     
@@ -434,7 +431,6 @@ def decode_attention_fwd(
         sm_scale,
         logit_cap,
     )
-    
     _decode_softmax_reducev_fwd(
         attn_logits,
         attn_lse,

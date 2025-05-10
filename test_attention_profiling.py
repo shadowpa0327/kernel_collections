@@ -78,14 +78,16 @@ def torch_profile_attention_implementations(
     k_B = torch.randn(bsz, num_kv_heads, k_rank, head_dim).to(dtype).to(device)
 
     group_query_attention_factorized_compiled = torch.compile(group_query_attention_factorized)
+    group_query_attention_factorized_v_only_compiled = torch.compile(partial(group_query_attention_factorized_v_only))
 
     # Warmup
     for _ in range(5):
         group_query_attention(q, k, v)
         group_query_attention_fa(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
-        group_query_attention_factorized_v_only(q, k, v_A, v_B, use_factorized=True)
+        group_query_attention_factorized_v_only(q, k, v_A, v_B)
         group_query_attention_factorized(q, k_A, k_B, v_A, v_B)
         group_query_attention_factorized_compiled(q, k_A, k_B, v_A, v_B)
+        group_query_attention_factorized_v_only_compiled(q, k, v_A, v_B)
     # Profile each implementation
     with profile(
         activities=[
@@ -111,16 +113,28 @@ def torch_profile_attention_implementations(
         
         # Factorized V-only attention
         with record_function("Factorized V-only Attention"):
-            group_query_attention_factorized_v_only(q, k, v_A, v_B, use_factorized=True)
+            group_query_attention_factorized_v_only(q, k, v_A, v_B)
             
         torch.cuda.synchronize()
         
         # Fully factorized attention
         with record_function("Fully Factorized Attention"):
             group_query_attention_factorized(q, k_A, k_B, v_A, v_B)
+    
+        torch.cuda.synchronize()
+
+        # Fully factorized attention (compiled)
+        with record_function("Fully Factorized Attention (compiled)"):
+            group_query_attention_factorized_compiled(q, k_A, k_B, v_A, v_B)
 
         torch.cuda.synchronize()
 
+        # Factorized V-only attention (compiled)
+        with record_function("Factorized V-only Attention (compiled)"):
+            group_query_attention_factorized_v_only_compiled(q, k, v_A, v_B)
+
+        torch.cuda.synchronize()
+        
     # Print profiling results
     print("\n=== Profiling Results ===")
     print(prof.key_averages().table(
@@ -172,14 +186,15 @@ def benchmark_attention_implementations(
     k_B = torch.randn(bsz, num_kv_heads, k_rank, head_dim).to(dtype).to(device)
     
     group_query_attention_factorized_compiled = torch.compile(group_query_attention_factorized)
-
+    group_query_attention_factorized_v_only_compiled = torch.compile(group_query_attention_factorized_v_only)
     # Warmup
     for _ in range(5):
         _ = group_query_attention(q, k, v)
         _ = group_query_attention_fa(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
-        _ = group_query_attention_factorized_v_only(q, k, v_A, v_B, use_factorized=True)
+        _ = group_query_attention_factorized_v_only(q, k, v_A, v_B)
         _ = group_query_attention_factorized(q, k_A, k_B, v_A, v_B)
         _ = group_query_attention_factorized_compiled(q, k_A, k_B, v_A, v_B)
+        _ = group_query_attention_factorized_v_only_compiled(q, k, v_A, v_B)
     torch.cuda.synchronize()
     
     # Time the standard implementation
@@ -213,7 +228,7 @@ def benchmark_attention_implementations(
         end_time = torch.cuda.Event(enable_timing=True)
         
         start_time.record()
-        output = group_query_attention_factorized_v_only(q, k, v_A, v_B, use_factorized=True)
+        output = group_query_attention_factorized_v_only(q, k, v_A, v_B)
         end_time.record()
         torch.cuda.synchronize()
         fv_times.append(start_time.elapsed_time(end_time))
@@ -242,23 +257,38 @@ def benchmark_attention_implementations(
         torch.cuda.synchronize()
         ff_times_compiled.append(start_time.elapsed_time(end_time))
     
+    # Time the factorized V-only attention (compiled)
+    fv_times_compiled = []
+    for _ in range(10):
+        start_time = torch.cuda.Event(enable_timing=True)
+        end_time = torch.cuda.Event(enable_timing=True)
+        
+        start_time.record()
+        output = group_query_attention_factorized_v_only_compiled(q, k, v_A, v_B)
+        end_time.record()
+        torch.cuda.synchronize()
+        fv_times_compiled.append(start_time.elapsed_time(end_time))
+    
+
     # Calculate average times
     avg_std_time = sum(std_times) / len(std_times)
     avg_fa_time = sum(fa_times) / len(fa_times)
     avg_fv_time = sum(fv_times) / len(fv_times)
     avg_ff_time = sum(ff_times) / len(ff_times)
     avg_ff_time_compiled = sum(ff_times_compiled) / len(ff_times_compiled)
-    
+    avg_fv_time_compiled = sum(fv_times_compiled) / len(fv_times_compiled)
     # Print results
     print("\n=== Benchmark Results ===")
     print(f"Standard Attention: {avg_std_time:.4f} ms")
     print(f"Flash Attention: {avg_fa_time:.4f} ms (Speedup: {avg_std_time/avg_fa_time:.2f}x)")
     print(f"Factorized V-only: {avg_fv_time:.4f} ms (Speedup: {avg_std_time/avg_fv_time:.2f}x)")
+    print(f"Factorized V-only (compiled): {avg_fv_time_compiled:.4f} ms (Speedup: {avg_std_time/avg_fv_time_compiled:.2f}x)")
     print(f"Fully Factorized: {avg_ff_time:.4f} ms (Speedup: {avg_std_time/avg_ff_time:.2f}x)")
     print(f"Fully Factorized (compiled): {avg_ff_time_compiled:.4f} ms (Speedup: {avg_std_time/avg_ff_time_compiled:.2f}x)")
     # Print speedups relative to Flash Attention
     print("\n=== Relative to Flash Attention ===")
     print(f"Factorized V-only vs Flash: {avg_fa_time/avg_fv_time:.2f}x")
+    print(f"Factorized V-only (compiled) vs Flash: {avg_fa_time/avg_fv_time_compiled:.2f}x")
     print(f"Fully Factorized vs Flash: {avg_fa_time/avg_ff_time:.2f}x")
     print(f"Fully Factorized (compiled) vs Flash: {avg_fa_time/avg_ff_time_compiled:.2f}x")
     # Print rank information
@@ -281,6 +311,21 @@ def test_torch_compile_group_query_attention_factorized():
     assert torch.allclose(output, output_compiled, atol=1e-4, rtol=1e-4), "Output is not identical"
     print("Compiled success output is identical")
 
+
+def test_torch_compile_group_query_attention_factorized_v_only():
+    group_query_attention_factorized_v_only_compiled = torch.compile(group_query_attention_factorized_v_only)
+    q = torch.randn(1, 32, 1, 128).to("cuda")
+    k = torch.randn(1, 8, 65536, 128).to("cuda")
+    v_A = torch.randn(1, 65536, 384).to("cuda")
+    v_B = torch.randn(1, 8, 384, 128).to("cuda")
+
+    output = group_query_attention_factorized_v_only(q, k, v_A, v_B)
+    output_compiled = group_query_attention_factorized_v_only_compiled(q, k, v_A, v_B)
+
+    assert torch.allclose(output, output_compiled, atol=1e-4, rtol=1e-4), "Output is not identical"
+    print("Compiled success output is identical")
+
+
 if __name__ == "__main__":
     # Default configuration
     import argparse
@@ -301,6 +346,7 @@ if __name__ == "__main__":
     total_rank = args.num_kv_heads * args.head_dim
     
     test_torch_compile_group_query_attention_factorized()
+    test_torch_compile_group_query_attention_factorized_v_only()
 
     # Run benchmark
     benchmark_attention_implementations(

@@ -25,9 +25,9 @@ import logging
 
 import triton
 import triton.language as tl
-
+from flash_attn import flash_attn_with_kvcache
 import torch
-
+from functools import partial
 logger = logging.getLogger(__name__)
 
 # TODO: Remove this when triton>=3.2.0. This issue will not affect performance and accuracy.
@@ -118,7 +118,7 @@ def _fwd_grouped_kernel_stage1(
         q_pe = tl.load(
             Q_PE + offs_q_pe #[1, BLOCK_DPE*q_head_num]
         )
-        tl.static_print("q_pe", q_pe)
+        #tl.static_print("q_pe", q_pe)
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             # Load K to K^T
@@ -164,7 +164,6 @@ def _fwd_grouped_kernel_stage1(
             p = tl.exp(qk - new_partial_qk_max[:, None])
             acc *= re_scale[:, None]
             acc += tl.dot(p.to(kv_nope.dtype), tl.trans(kv_nope))
-
             partial_exp_sum = partial_exp_sum * re_scale + tl.sum(p, 1)
             partial_qk_max = new_partial_qk_max
 
@@ -224,7 +223,7 @@ def _decode_grouped_att_m_fwd(
 
     extra_kargs = {}
     num_stages = 2
-    print(d_nope, d_pe, head_num, kv_group_num, kv_seq_len)
+    #print(d_nope, d_pe, head_num, kv_group_num, kv_seq_len)
     _fwd_grouped_kernel_stage1[grid](
         Q_NOPE=q_nope,
         Q_PE=q_pe,
@@ -369,10 +368,10 @@ def decode_attention_fwd(
     sm_scale=1.0,       # float: softmax scaling factor
     logit_cap=0.0,      # float: cap for logits
 ):
-    print(q_pe.shape)
-    print(q_nope.shape)
-    print(kv_nope_buffer.shape)
-    print(kv_pe_buffer.shape)
+    #print(q_pe.shape)
+    #print(q_nope.shape)
+    #print(kv_nope_buffer.shape)
+    #print(kv_pe_buffer.shape)
     batch, num_q_heads, head_dim = q_nope.shape
     _, kv_len, num_kv_heads, _ = kv_nope_buffer.shape
     
@@ -382,8 +381,8 @@ def decode_attention_fwd(
     
     # Determine number of KV splits if not provided
     # FIXME(brian1009): Determine the optimal number of KV splits on the fly
-    num_kv_splits = torch.ones(batch, dtype=torch.int32, device=q.device) * 4
-    max_kv_splits = 4
+    num_kv_splits = torch.ones(batch, dtype=torch.int32, device=q.device) * 64
+    max_kv_splits = 64
 
     # Create intermediate tensors for attention computation
     attn_logits = torch.empty(
@@ -435,7 +434,7 @@ import argparse
 import argparse
 
 
-def mha2mla_ref(q, q_pe, kv, k_pe):
+def mha2mla_ref(q, q_pe, kv, k_pe, scale=1.0):
     """
     Inputs:
     - q (Tensor): [batch, q_head_num, q_len=1, dim]
@@ -449,7 +448,7 @@ def mha2mla_ref(q, q_pe, kv, k_pe):
     dim = q.shape[-1]
     pe_dim = q_pe.shape[-1]
     #scale = (dim + pe_dim)**0.5
-    scale = 1.0
+    #scale = 1.0
     seqlen_q = q.shape[1]
     kv_head_num = kv.shape[1]
     q_head_num = q.shape[2]
@@ -479,13 +478,23 @@ def mha2mla_ref(q, q_pe, kv, k_pe):
     out = out.squeeze(2) # [batch, q_head_num, dim] Ex: (bsz, 32, 512)
     return out
 
+def flash_attn_mha_fwd(
+        q, # shape: [batch, q_len, q_head_num, dim]
+        k, # shape: [batch, kv_len, kv_head_num, dim]
+        v, # shape: [batch, kv_len, kv_head_num, dim]   
+    ):
+    return flash_attn_with_kvcache(
+        q,
+        k,
+        v,
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--batch', type=int, default=1, help='batch size')
+    parser.add_argument('--batch', type=int, default=8, help='batch size')
     parser.add_argument('--heads', type=int, default=32, help='q heads number')
     parser.add_argument('--kv_heads', type=int, default=1, help='kv heads number')
-    parser.add_argument('--kv_ctx', type=int, default=512, help='kv context length')
+    parser.add_argument('--kv_ctx', type=int, default=16384, help='kv context length')
     parser.add_argument('--dim', type=int, default=512, help='head dim')
     parser.add_argument('--pe_dim', type=int, default=16, help='pe head dim')
     args = parser.parse_args()
@@ -498,17 +507,102 @@ if __name__ == "__main__":
     k_pe = torch.randn(batch, heads, kv_ctx, pe_dim, device="cuda", dtype=torch.float16)  # [batch, q_head_num, kv_len, pe_dim]
     
     # Run the reference program
-    ref_output = mha2mla_ref(q.unsqueeze(1), q_pe.unsqueeze(1), kv, k_pe)
-    print(ref_output.shape)
+    ref_output = mha2mla_ref(q.unsqueeze(1), q_pe.unsqueeze(1), kv, k_pe, scale=0.5)
 
     out = decode_attention_fwd(
         q_nope=q.squeeze(1), 
         q_pe=q_pe.reshape(batch, heads*pe_dim), 
         kv_nope_buffer=kv.transpose(1, 2).contiguous(), 
-        kv_pe_buffer=k_pe.transpose(1, 2).reshape(batch, kv_ctx, heads*pe_dim).contiguous()
+        kv_pe_buffer=k_pe.transpose(1, 2).reshape(batch, kv_ctx, heads*pe_dim).contiguous(),
+        sm_scale=0.5
     )
-    print(out)
+    #print(out)
     print("Output from Reference: ", ref_output)
     print("Output from Triton: ", out)
 
     print("Difference: ", torch.max(torch.abs(ref_output - out)))
+
+
+    # Add timing code to compare performance between reference and Triton implementations
+    import time
+    
+    def measure_time(func, *args, warmup=10, repeat=100):
+        """
+        Measure the execution time of a function.
+        
+        Args:
+            func: Function to measure
+            args: Arguments to pass to the function
+            warmup: Number of warmup iterations
+            repeat: Number of measurement iterations
+        
+        Returns:
+            Average execution time in milliseconds
+        """
+        # Warmup
+        for _ in range(warmup):
+            func(*args)
+        
+        torch.cuda.synchronize()
+        
+        # Measure
+        start = time.time()
+        for _ in range(repeat):
+            func(*args)
+        torch.cuda.synchronize()
+        end = time.time()
+        
+        return (end - start) * 1000 / repeat  # Convert to ms
+    
+    print("Start measuring performance...")
+    
+    q_ = q.unsqueeze(1)
+    q_pe_ = q_pe.unsqueeze(1)
+       
+    ## Reference MHA2MLA (Torch)
+    time_ref = measure_time(
+        partial(mha2mla_ref,
+            q=q_, 
+            q_pe=q_pe_, 
+            kv=kv, 
+            k_pe=k_pe
+        )
+    )
+    
+    ## Triton MHA2MLA
+    q__ = q.squeeze(1)
+    q_pe__ = q_pe.reshape(batch, heads*pe_dim)
+    kv_nope_buffer__ = kv.transpose(1, 2).contiguous()
+    kv_pe_buffer__ = k_pe.transpose(1, 2).reshape(batch, kv_ctx, heads*pe_dim).contiguous()
+    # Measure Triton implementation
+    time_triton = measure_time(
+        partial(decode_attention_fwd,
+            q_nope=q__, 
+            q_pe=q_pe__, 
+            kv_nope_buffer=kv_nope_buffer__, 
+            kv_pe_buffer=kv_pe_buffer__
+        )
+    )
+    
+    ## Flash2 MHA
+    q_fa = torch.randn(batch, 1, heads, 128, device="cuda", dtype=torch.float16)
+    k_fa = torch.randn(batch, kv_ctx, 32, 128, device="cuda", dtype=torch.float16)
+    v_fa = torch.randn(batch, kv_ctx, 32, 128, device="cuda", dtype=torch.float16)
+    time_flash = measure_time(
+        partial(flash_attn_mha_fwd,
+            q=q_fa, k=k_fa, v=v_fa
+        )
+    )
+    print("========== Performance Measurements ==========")
+    print("Batch size: ", batch)
+    print("Q heads: ", heads)
+    print("KV heads: ", kv_heads)
+    print("KV context length: ", kv_ctx)
+    print("Latent dim: ", dim)
+    print("PE dim: ", pe_dim)
+    print("MHA Head dim: ", 128)
+    print(f"Reference implementation: {time_ref:.4f} ms")
+    print(f"Triton implementation: {time_triton:.4f} ms")
+    print(f"Flash implementation: {time_flash:.4f} ms")
+    print(f"Speedup (Triton MHA2MLA vs Torch MHA2MLA): {time_ref / time_triton:.2f}x")
+    print(f"Speedup (Flash2 MHA vs Triton MHA2MLA): {time_flash / time_triton:.2f}x")
