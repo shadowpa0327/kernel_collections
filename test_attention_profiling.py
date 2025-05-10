@@ -4,7 +4,13 @@ from torch.profiler import profile, record_function, ProfilerActivity
 from functools import partial
 import os
 from termcolor import colored
-from attention import group_query_attention, group_query_attention_fa, group_query_attention_factorized_v_only, group_query_attention_factorized
+from attention import (
+    group_query_attention, 
+    group_query_attention_fa, 
+    group_query_attention_factorized_v_only, 
+    group_query_attention_factorized,
+    group_query_attention_factorized_RoPE
+)
 import time
 import socket
 
@@ -36,7 +42,7 @@ def torch_profile_attention_implementations(
     kv_len=65536,  # 64K sequence length
     k_rank=384,
     v_rank=384,
-    dtype=torch.bfloat16,
+    dtype=torch.float16,
     device="cuda",
     output_dir="torch_profile_output"
 ):
@@ -79,7 +85,7 @@ def torch_profile_attention_implementations(
 
     group_query_attention_factorized_compiled = torch.compile(group_query_attention_factorized)
     group_query_attention_factorized_v_only_compiled = torch.compile(partial(group_query_attention_factorized_v_only))
-
+    group_query_attention_factorized_RoPE_compiled = torch.compile(group_query_attention_factorized_RoPE)
     # Warmup
     for _ in range(5):
         group_query_attention(q, k, v)
@@ -88,6 +94,8 @@ def torch_profile_attention_implementations(
         group_query_attention_factorized(q, k_A, k_B, v_A, v_B)
         group_query_attention_factorized_compiled(q, k_A, k_B, v_A, v_B)
         group_query_attention_factorized_v_only_compiled(q, k, v_A, v_B)
+        group_query_attention_factorized_RoPE(q, k_A, k_B, v_A, v_B)
+        group_query_attention_factorized_RoPE_compiled(q, k_A, k_B, v_A, v_B)
     # Profile each implementation
     with profile(
         activities=[
@@ -134,6 +142,18 @@ def torch_profile_attention_implementations(
             group_query_attention_factorized_v_only_compiled(q, k, v_A, v_B)
 
         torch.cuda.synchronize()
+
+        # Fully factorized attention (compiled)
+        with record_function("Fully Factorized Attention (compiled)"):
+            group_query_attention_factorized_compiled(q, k_A, k_B, v_A, v_B)
+
+        torch.cuda.synchronize()
+
+        # Fully factorized attention (compiled)
+        with record_function("Fully Factorized Attention (compiled)"):
+            group_query_attention_factorized_compiled(q, k_A, k_B, v_A, v_B)
+
+        torch.cuda.synchronize()
         
     # Print profiling results
     print("\n=== Profiling Results ===")
@@ -170,7 +190,7 @@ def benchmark_attention_implementations(
     bsz = 1
     q_len = 1
     device = "cuda"
-    dtype = torch.bfloat16
+    dtype = torch.float16
     
     # Create random tensors for Q, K, V
     q = torch.randn(bsz, num_heads, q_len, head_dim).to(dtype).to(device)
@@ -187,6 +207,7 @@ def benchmark_attention_implementations(
     
     group_query_attention_factorized_compiled = torch.compile(group_query_attention_factorized)
     group_query_attention_factorized_v_only_compiled = torch.compile(group_query_attention_factorized_v_only)
+    group_query_attention_factorized_RoPE_compiled = torch.compile(group_query_attention_factorized_RoPE)
     # Warmup
     for _ in range(5):
         _ = group_query_attention(q, k, v)
@@ -195,6 +216,8 @@ def benchmark_attention_implementations(
         _ = group_query_attention_factorized(q, k_A, k_B, v_A, v_B)
         _ = group_query_attention_factorized_compiled(q, k_A, k_B, v_A, v_B)
         _ = group_query_attention_factorized_v_only_compiled(q, k, v_A, v_B)
+        _ = group_query_attention_factorized_RoPE(q, k_A, k_B, v_A, v_B)
+        _ = group_query_attention_factorized_RoPE_compiled(q, k_A, k_B, v_A, v_B)
     torch.cuda.synchronize()
     
     # Time the standard implementation
@@ -269,6 +292,29 @@ def benchmark_attention_implementations(
         torch.cuda.synchronize()
         fv_times_compiled.append(start_time.elapsed_time(end_time))
     
+    # Time the fully factorized attention (compiled)# 
+    ff_times_RoPE = []
+    for _ in range(10):
+        start_time = torch.cuda.Event(enable_timing=True)
+        end_time = torch.cuda.Event(enable_timing=True)
+        
+        start_time.record()
+        output = group_query_attention_factorized_RoPE(q, k_A, k_B, v_A, v_B)
+        end_time.record()
+        torch.cuda.synchronize()
+        ff_times_RoPE.append(start_time.elapsed_time(end_time))
+    
+    # Time the fully factorized attention (compiled)# 
+    ff_times_compiled_RoPE = []
+    for _ in range(10):
+        start_time = torch.cuda.Event(enable_timing=True)
+        end_time = torch.cuda.Event(enable_timing=True)
+        
+        start_time.record()
+        output = group_query_attention_factorized_RoPE_compiled(q, k_A, k_B, v_A, v_B)
+        end_time.record()
+        torch.cuda.synchronize()
+        ff_times_compiled_RoPE.append(start_time.elapsed_time(end_time))
 
     # Calculate average times
     avg_std_time = sum(std_times) / len(std_times)
@@ -277,6 +323,8 @@ def benchmark_attention_implementations(
     avg_ff_time = sum(ff_times) / len(ff_times)
     avg_ff_time_compiled = sum(ff_times_compiled) / len(ff_times_compiled)
     avg_fv_time_compiled = sum(fv_times_compiled) / len(fv_times_compiled)
+    avg_ff_time_RoPE = sum(ff_times_RoPE) / len(ff_times_RoPE)
+    avg_ff_time_compiled_RoPE = sum(ff_times_compiled_RoPE) / len(ff_times_compiled_RoPE)
     # Print results
     print("\n=== Benchmark Results ===")
     print(f"Standard Attention: {avg_std_time:.4f} ms")
@@ -285,12 +333,16 @@ def benchmark_attention_implementations(
     print(f"Factorized V-only (compiled): {avg_fv_time_compiled:.4f} ms (Speedup: {avg_std_time/avg_fv_time_compiled:.2f}x)")
     print(f"Fully Factorized: {avg_ff_time:.4f} ms (Speedup: {avg_std_time/avg_ff_time:.2f}x)")
     print(f"Fully Factorized (compiled): {avg_ff_time_compiled:.4f} ms (Speedup: {avg_std_time/avg_ff_time_compiled:.2f}x)")
+    print(f"Fully Factorized RoPE: {avg_ff_time_RoPE:.4f} ms (Speedup: {avg_std_time/avg_ff_time_RoPE:.2f}x)")
+    print(f"Fully Factorized RoPE (compiled): {avg_ff_time_compiled_RoPE:.4f} ms (Speedup: {avg_std_time/avg_ff_time_compiled_RoPE:.2f}x)")
     # Print speedups relative to Flash Attention
     print("\n=== Relative to Flash Attention ===")
     print(f"Factorized V-only vs Flash: {avg_fa_time/avg_fv_time:.2f}x")
     print(f"Factorized V-only (compiled) vs Flash: {avg_fa_time/avg_fv_time_compiled:.2f}x")
     print(f"Fully Factorized vs Flash: {avg_fa_time/avg_ff_time:.2f}x")
     print(f"Fully Factorized (compiled) vs Flash: {avg_fa_time/avg_ff_time_compiled:.2f}x")
+    print(f"Fully Factorized RoPE vs Flash: {avg_fa_time/avg_ff_time_RoPE:.2f}x")
+    print(f"Fully Factorized RoPE (compiled) vs Flash: {avg_fa_time/avg_ff_time_compiled_RoPE:.2f}x")
     # Print rank information
     print("\n=== Rank Information ===")
     print(f"Per-layer K rank: {k_rank} (Compression Rate: {total_rank/k_rank:.2f}x)")
@@ -337,7 +389,7 @@ if __name__ == "__main__":
     parser.add_argument('--head_dim', type=int, default=128, help='Dimension of each head')
     parser.add_argument('--kv_len', type=int, default=128*1024, help='Length of key/value sequence')
     parser.add_argument('--k_rank', type=int, default=384, help='Rank for factorized key matrices')
-    parser.add_argument('--v_rank', type=int, default=384, help='Rank for factorized value matrices')
+    parser.add_argument('--v_rank', type=int, default=512, help='Rank for factorized value matrices')
     parser.add_argument('--profile', action='store_true', help='Run profiling')
     
     args = parser.parse_args()
