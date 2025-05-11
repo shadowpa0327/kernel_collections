@@ -9,8 +9,16 @@ from attention import (
     group_query_attention_fa, 
     group_query_attention_factorized_v_only, 
     group_query_attention_factorized,
-    group_query_attention_factorized_RoPE
+    group_query_attention_factorized_RoPE,
+    group_query_attention_sdpa
 )
+
+from flash_recontruction import (
+    gqa_xKV_no_pe,
+    gqa_xKV_no_pe_v2,
+    gqa_xKV_no_pe_k_only
+)
+
 import time
 import socket
 
@@ -75,7 +83,7 @@ def torch_profile_attention_implementations(
     q = torch.randn(bsz, num_heads, q_len, head_dim).to(dtype).to(device)
     k = torch.randn(bsz, num_kv_heads, kv_len, head_dim).to(dtype).to(device)
     v = torch.randn(bsz, num_kv_heads, kv_len, head_dim).to(dtype).to(device)
-    
+    q_reshaped = q.reshape(bsz, num_heads*q_len, head_dim)
     # Create factorized matrices
     v_A = torch.randn(bsz, kv_len, v_rank).to(dtype).to(device)
     v_B = torch.randn(bsz, num_kv_heads, v_rank, head_dim).to(dtype).to(device)
@@ -86,6 +94,12 @@ def torch_profile_attention_implementations(
     group_query_attention_factorized_compiled = torch.compile(group_query_attention_factorized)
     group_query_attention_factorized_v_only_compiled = torch.compile(partial(group_query_attention_factorized_v_only))
     group_query_attention_factorized_RoPE_compiled = torch.compile(group_query_attention_factorized_RoPE)
+
+    # meta data for fused attention
+    o = torch.empty(bsz, num_heads, head_dim, device=device, dtype=dtype)
+    num_kv_splits = torch.tensor([128], dtype=torch.int32, device=device)
+    max_kv_splits = 128
+
     # Warmup
     for _ in range(5):
         group_query_attention(q, k, v)
@@ -96,6 +110,10 @@ def torch_profile_attention_implementations(
         group_query_attention_factorized_v_only_compiled(q, k, v_A, v_B)
         group_query_attention_factorized_RoPE(q, k_A, k_B, v_A, v_B)
         group_query_attention_factorized_RoPE_compiled(q, k_A, k_B, v_A, v_B)
+        _ = gqa_xKV_no_pe(q_reshaped, k_A, k_B, v_A, v_B, o, num_kv_splits, max_kv_splits)
+        _ = gqa_xKV_no_pe_v2(q_reshaped, k_A, k_B, v_A, v_B, num_kv_splits, max_kv_splits)
+        _ = gqa_xKV_no_pe_k_only(q_reshaped, k_A, k_B, v.transpose(1, 2), o, num_kv_splits, max_kv_splits)
+        _ = group_query_attention_sdpa(q, k, v)
     # Profile each implementation
     with profile(
         activities=[
@@ -143,15 +161,39 @@ def torch_profile_attention_implementations(
 
         torch.cuda.synchronize()
 
-        # Fully factorized attention (compiled)
-        with record_function("Fully Factorized Attention (compiled)"):
-            group_query_attention_factorized_compiled(q, k_A, k_B, v_A, v_B)
+        # Fully factorized attention (compiled) RoPE
+        with record_function("Fully Factorized Attention (compiled) RoPE"):
+            group_query_attention_factorized_RoPE_compiled(q, k_A, k_B, v_A, v_B)
 
         torch.cuda.synchronize()
 
-        # Fully factorized attention (compiled)
-        with record_function("Fully Factorized Attention (compiled)"):
-            group_query_attention_factorized_compiled(q, k_A, k_B, v_A, v_B)
+        # Fully factorized attention RoPE
+        with record_function("Fully Factorized Attention RoPE"):
+            group_query_attention_factorized_RoPE(q, k_A, k_B, v_A, v_B)
+
+        torch.cuda.synchronize()
+
+        # Fused attention
+        with record_function("Fused Attention"):
+            _ = gqa_xKV_no_pe(q_reshaped, k_A, k_B, v_A, v_B, o, num_kv_splits, max_kv_splits)
+
+        torch.cuda.synchronize()
+
+        # Fused attention v2
+        with record_function("Fused Attention v2"):
+            _ = gqa_xKV_no_pe_v2(q_reshaped, k_A, k_B, v_A, v_B, num_kv_splits, max_kv_splits)
+            
+        torch.cuda.synchronize()
+
+        # Fused attention k only
+        with record_function("Fused Attention k only"):
+            _ = gqa_xKV_no_pe_k_only(q_reshaped, k_A, k_B, v.transpose(1, 2), o, num_kv_splits, max_kv_splits)
+
+        torch.cuda.synchronize()
+
+        # SDPA
+        with record_function("SDPA"):
+            _ = group_query_attention_sdpa(q, k, v)
 
         torch.cuda.synchronize()
         
@@ -194,6 +236,7 @@ def benchmark_attention_implementations(
     
     # Create random tensors for Q, K, V
     q = torch.randn(bsz, num_heads, q_len, head_dim).to(dtype).to(device)
+    q_reshaped = q.reshape(bsz, num_heads*q_len, head_dim)
     k = torch.randn(bsz, num_kv_heads, kv_len, head_dim).to(dtype).to(device)
     v = torch.randn(bsz, num_kv_heads, kv_len, head_dim).to(dtype).to(device)
     
@@ -205,6 +248,11 @@ def benchmark_attention_implementations(
     k_A = torch.randn(bsz, kv_len, k_rank).to(dtype).to(device)
     k_B = torch.randn(bsz, num_kv_heads, k_rank, head_dim).to(dtype).to(device)
     
+    # buffer and metadata for fused attention
+    o = torch.empty(bsz, num_heads, head_dim, device=device, dtype=dtype)
+    num_kv_splits = torch.tensor([128], dtype=torch.int32, device=device)
+    max_kv_splits = 128
+
     group_query_attention_factorized_compiled = torch.compile(group_query_attention_factorized)
     group_query_attention_factorized_v_only_compiled = torch.compile(group_query_attention_factorized_v_only)
     group_query_attention_factorized_RoPE_compiled = torch.compile(group_query_attention_factorized_RoPE)
@@ -218,6 +266,10 @@ def benchmark_attention_implementations(
         _ = group_query_attention_factorized_v_only_compiled(q, k, v_A, v_B)
         _ = group_query_attention_factorized_RoPE(q, k_A, k_B, v_A, v_B)
         _ = group_query_attention_factorized_RoPE_compiled(q, k_A, k_B, v_A, v_B)
+        _ = gqa_xKV_no_pe(q_reshaped, k_A, k_B, v_A, v_B, o, num_kv_splits, max_kv_splits)
+        _ = gqa_xKV_no_pe_v2(q_reshaped, k_A, k_B, v_A, v_B, num_kv_splits, max_kv_splits)
+        _ = gqa_xKV_no_pe_k_only(q_reshaped, k_A, k_B, v.transpose(1, 2), o, num_kv_splits, max_kv_splits)
+        _ = group_query_attention_sdpa(q, k, v)
     torch.cuda.synchronize()
     
     # Time the standard implementation
@@ -316,6 +368,51 @@ def benchmark_attention_implementations(
         torch.cuda.synchronize()
         ff_times_compiled_RoPE.append(start_time.elapsed_time(end_time))
 
+    # Time the fused attention implementations
+    gqa_xKV_no_pe_times = []
+    for _ in range(10):
+        start_time = torch.cuda.Event(enable_timing=True)
+        end_time = torch.cuda.Event(enable_timing=True)
+        
+        start_time.record()
+        _ = gqa_xKV_no_pe(q_reshaped, k_A, k_B, v_A, v_B, o, num_kv_splits, max_kv_splits)
+        end_time.record()
+        torch.cuda.synchronize()
+        gqa_xKV_no_pe_times.append(start_time.elapsed_time(end_time))
+
+    gqa_xKV_no_pe_v2_times = []
+    for _ in range(10):
+        start_time = torch.cuda.Event(enable_timing=True)
+        end_time = torch.cuda.Event(enable_timing=True)
+        
+        start_time.record()
+        _ = gqa_xKV_no_pe_v2(q_reshaped, k_A, k_B, v_A, v_B, num_kv_splits, max_kv_splits)
+        end_time.record()
+        torch.cuda.synchronize()
+        gqa_xKV_no_pe_v2_times.append(start_time.elapsed_time(end_time))
+
+    gqa_xKV_no_pe_k_only_times = []
+    for _ in range(10):
+        start_time = torch.cuda.Event(enable_timing=True)
+        end_time = torch.cuda.Event(enable_timing=True)
+        
+        start_time.record()
+        _ = gqa_xKV_no_pe_k_only(q_reshaped, k_A, k_B, v.transpose(1, 2), o, num_kv_splits, max_kv_splits)
+        end_time.record()
+        torch.cuda.synchronize()
+        gqa_xKV_no_pe_k_only_times.append(start_time.elapsed_time(end_time))
+
+    sdpa_times = []
+    for _ in range(10):
+        start_time = torch.cuda.Event(enable_timing=True)
+        end_time = torch.cuda.Event(enable_timing=True)
+        
+        start_time.record()
+        _ = group_query_attention_sdpa(q, k, v)
+        end_time.record()
+        torch.cuda.synchronize()
+        sdpa_times.append(start_time.elapsed_time(end_time))
+
     # Calculate average times
     avg_std_time = sum(std_times) / len(std_times)
     avg_fa_time = sum(fa_times) / len(fa_times)
@@ -325,6 +422,11 @@ def benchmark_attention_implementations(
     avg_fv_time_compiled = sum(fv_times_compiled) / len(fv_times_compiled)
     avg_ff_time_RoPE = sum(ff_times_RoPE) / len(ff_times_RoPE)
     avg_ff_time_compiled_RoPE = sum(ff_times_compiled_RoPE) / len(ff_times_compiled_RoPE)
+    avg_gqa_xKV_no_pe_time = sum(gqa_xKV_no_pe_times) / len(gqa_xKV_no_pe_times)
+    avg_gqa_xKV_no_pe_v2_time = sum(gqa_xKV_no_pe_v2_times) / len(gqa_xKV_no_pe_v2_times)
+    avg_gqa_xKV_no_pe_k_only_time = sum(gqa_xKV_no_pe_k_only_times) / len(gqa_xKV_no_pe_k_only_times)
+    avg_sdpa_time = sum(sdpa_times) / len(sdpa_times)
+
     # Print results
     print("\n=== Benchmark Results ===")
     print(f"Standard Attention: {avg_std_time:.4f} ms")
@@ -335,6 +437,11 @@ def benchmark_attention_implementations(
     print(f"Fully Factorized (compiled): {avg_ff_time_compiled:.4f} ms (Speedup: {avg_std_time/avg_ff_time_compiled:.2f}x)")
     print(f"Fully Factorized RoPE: {avg_ff_time_RoPE:.4f} ms (Speedup: {avg_std_time/avg_ff_time_RoPE:.2f}x)")
     print(f"Fully Factorized RoPE (compiled): {avg_ff_time_compiled_RoPE:.4f} ms (Speedup: {avg_std_time/avg_ff_time_compiled_RoPE:.2f}x)")
+    print(f"Fused Attention k only: {avg_gqa_xKV_no_pe_k_only_time:.4f} ms (Speedup: {avg_std_time/avg_gqa_xKV_no_pe_k_only_time:.2f}x)")
+    print(f"Fused Attention: {avg_gqa_xKV_no_pe_time:.4f} ms (Speedup: {avg_std_time/avg_gqa_xKV_no_pe_time:.2f}x)")
+    print(f"Fused Attention v2: {avg_gqa_xKV_no_pe_v2_time:.4f} ms (Speedup: {avg_std_time/avg_gqa_xKV_no_pe_v2_time:.2f}x)")
+    print(f"SDPA: {avg_sdpa_time:.4f} ms (Speedup: {avg_std_time/avg_sdpa_time:.2f}x)")
+
     # Print speedups relative to Flash Attention
     print("\n=== Relative to Flash Attention ===")
     print(f"Factorized V-only vs Flash: {avg_fa_time/avg_fv_time:.2f}x")
@@ -343,6 +450,23 @@ def benchmark_attention_implementations(
     print(f"Fully Factorized (compiled) vs Flash: {avg_fa_time/avg_ff_time_compiled:.2f}x")
     print(f"Fully Factorized RoPE vs Flash: {avg_fa_time/avg_ff_time_RoPE:.2f}x")
     print(f"Fully Factorized RoPE (compiled) vs Flash: {avg_fa_time/avg_ff_time_compiled_RoPE:.2f}x")
+    print(f"Fused Attention k only vs Flash: {avg_fa_time/avg_gqa_xKV_no_pe_k_only_time:.2f}x")
+    print(f"Fused Attention vs Flash: {avg_fa_time/avg_gqa_xKV_no_pe_time:.2f}x")
+    print(f"Fused Attention v2 vs Flash: {avg_fa_time/avg_gqa_xKV_no_pe_v2_time:.2f}x")
+
+
+    # print speedups relative to SDPA
+    print("\n=== Relative to SDPA ===")
+    print(f"Fused Attention vs SDPA: {avg_sdpa_time/avg_gqa_xKV_no_pe_time:.2f}x")
+    print(f"Fused Attention v2 vs SDPA: {avg_sdpa_time/avg_gqa_xKV_no_pe_v2_time:.2f}x")
+    print(f"Fused Attention k only vs SDPA: {avg_sdpa_time/avg_gqa_xKV_no_pe_k_only_time:.2f}x")
+    print(f"Fully Factorized vs SDPA: {avg_sdpa_time/avg_ff_time:.2f}x")
+    print(f"Fully Factorized (compiled) vs SDPA: {avg_sdpa_time/avg_ff_time_compiled:.2f}x")
+    print(f"Fully Factorized RoPE vs SDPA: {avg_sdpa_time/avg_ff_time_RoPE:.2f}x")
+    print(f"Fully Factorized RoPE (compiled) vs SDPA: {avg_sdpa_time/avg_ff_time_compiled_RoPE:.2f}x")
+    print(f"Factorized V-only vs SDPA: {avg_sdpa_time/avg_fv_time:.2f}x")
+    print(f"Factorized V-only (compiled) vs SDPA: {avg_sdpa_time/avg_fv_time_compiled:.2f}x")
+
     # Print rank information
     print("\n=== Rank Information ===")
     print(f"Per-layer K rank: {k_rank} (Compression Rate: {total_rank/k_rank:.2f}x)")

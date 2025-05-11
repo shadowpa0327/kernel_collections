@@ -7,7 +7,7 @@ def get_configs():
     configs = []
     for block_l in [32, 64, 128]:
         for block_r in [16, 32, 64]:
-            for num_warps in [2, 4, 8]:
+            for num_warps in [4, 8]:
                 for num_stages in [1, 2, 3, 4, 8]:
                     configs.append(
                         triton.Config({'BLOCK_SIZE_L': block_l, 'BLOCK_SIZE_R': block_r},
@@ -48,42 +48,35 @@ def _qAB_fwd(
     O_ptrs = out_ptr + pid_b * stride_o_b + (pid_hg * stride_o_g + offs_qls[:, None]*stride_o_lq + offs_ls[None, :]*stride_o_lkv)
 
     # Fix BLOCK_SIZE_D = 64, and head_dim = 128
-    ab_0 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
-    ab_1 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
+    #ab_0 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
+    #ab_1 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
 
-    for _ in tl.range(0, tl.cdiv(RANK, BLOCK_SIZE_R)):
-
-        # Load next block of A, B
-        a = tl.load(A_ptrs, mask=offs_ls[:, None] < KV_LEN, other=0.0, eviction_policy="evict_first")
+    start_block = pid_l * BLOCK_SIZE_L
+    cos, sin = _sin_cos(starting_idx=start_block, theta=THETA, NB_TOKENS=BLOCK_SIZE_L)
+    out_0 = tl.zeros((16, BLOCK_SIZE_L), dtype=tl.float32)
+    out_1 = tl.zeros((16, BLOCK_SIZE_L), dtype=tl.float32)
+    q1 = tl.load(Q_ptrs, mask=offs_qls[:, None] < Q_LEN, other=0.0)
+    q2 = tl.load(Q_ptrs + BLOCK_SIZE_D * stride_q_d, mask=offs_qls[:, None] < Q_LEN, other=0.0)
+    for _ in range(0, tl.cdiv(RANK, BLOCK_SIZE_R)):
         # Accumulate along R dimension.
-        b_0 = tl.load(B_ptrs, eviction_policy="evict_last")
-        ab_0 = tl.dot(a, b_0, ab_0)
+        b_0 = tl.load(B_ptrs, cache_modifier=".cg")
+        # Load next block of A, B
+        a = tl.load(A_ptrs, mask=offs_ls[:, None] < KV_LEN, other=0.0, cache_modifier=".cv")
+        partial_ab_0 = tl.dot(a, b_0)
         
-        b_1 = tl.load(B_ptrs + BLOCK_SIZE_D * stride_B_d, eviction_policy="evict_last")
-        ab_1 = tl.dot(a, b_1, ab_1)
+        b_1 = tl.load(B_ptrs + BLOCK_SIZE_D * stride_B_d, cache_modifier=".cg")
+        partial_ab_1 = tl.dot(a, b_1)
         
+        partial_ab_0_pe = partial_ab_0 * cos - partial_ab_1 * sin
+        partial_ab_1_pe = partial_ab_1 * cos + partial_ab_0 * sin
+
+        out_0 = tl.dot(q1, (partial_ab_0_pe.T).to(q1.dtype), out_0)
+        out_1 = tl.dot(q2, (partial_ab_1_pe.T).to(q2.dtype), out_1)
+
         # Advance the pointers to next blocks
         A_ptrs += BLOCK_SIZE_R * stride_A_r
         B_ptrs += BLOCK_SIZE_R * stride_B_r
 
-    #ab_0 = ab_0.to(tl.float16)
-    #ab_1 = ab_1.to(tl.float16)
-
-    start_block = pid_l * BLOCK_SIZE_L
-    cos, sin = _sin_cos(starting_idx=start_block, theta=THETA, NB_TOKENS=BLOCK_SIZE_L)
-    #cos = cos.to(tl.float16)
-   # sin = sin.to(tl.float16)
-    
-    ab_0_pe = ab_0 * cos - ab_1 * sin
-    ab_1_pe = ab_1 * cos + ab_0 * sin
-
-    ab_0_pe = ab_0_pe.to(tl.float16)
-    ab_1_pe = ab_1_pe.to(tl.float16)
-
-    q1 = tl.load(Q_ptrs, mask=offs_qls[:, None] < Q_LEN, other=0.0)
-    out_0 = tl.dot(q1, ab_0_pe.T).to(tl.float16)
-    q2 = tl.load(Q_ptrs + BLOCK_SIZE_D * stride_q_d, mask=offs_qls[:, None] < Q_LEN, other=0.0)
-    out_1 = tl.dot(q2, ab_1_pe.T).to(tl.float16)
     out = out_0 + out_1
     
     tl.store(O_ptrs, out, mask=((offs_qls[:, None] < Q_LEN) & (offs_ls[None, :] < KV_LEN)))

@@ -29,7 +29,7 @@ def decode_attention_reference(
     qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32).to(qk.dtype)  # [batch, num_kv_heads, num_q_heads_per_kv_group, kv_len]
     # Step 4: Compute o = softmax(q@K) @ V
     o = torch.matmul(qk, v_buffer) # [batch, num_kv_heads, num_q_heads_per_kv_group, head_dim]
-    o = o.view(batch, num_q_heads, head_dim)
+    o = o.view(batch, num_q_heads, head_dim)    
     return o
 
 

@@ -94,8 +94,8 @@ if __name__ == "__main__":
     q_len = 1
     bsz = 1
     num_heads = 32
-    num_kv_heads = 4
-    rank = 192
+    num_kv_heads = 8
+    rank = 384
     head_dim = 128
     kv_len = 65536*2
 

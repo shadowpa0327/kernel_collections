@@ -190,6 +190,15 @@ def group_query_attention_fa(
 ):
     return flash_attn_with_kvcache(query, key, value, causal=True)
 
+def group_query_attention_sdpa(
+    query,
+    key,
+    value,
+    attn_mask=None,
+    dropout_p=0.0
+):
+    return torch.nn.functional.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, enable_gqa=True)
+
 def group_query_attention_factorized_v_only(
     query,                  # (bsz, num_heads, q_len, head_dim)
     key,                    # (bsz, num_kv_heads, kv_len, head_dim)
