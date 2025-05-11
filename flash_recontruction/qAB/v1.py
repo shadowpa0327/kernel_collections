@@ -6,7 +6,7 @@ from flash_recontruction.rope.sin_cos import _sin_cos
 def get_configs():
     configs = []
     for block_l in [32, 64, 128]:
-        for block_r in [16, 32, 64]:
+        for block_r in [16, 32, 64, 128]:
             for num_warps in [2, 4, 8]:
                 for num_stages in [1, 2, 3, 4, 8]:
                     configs.append(
@@ -48,19 +48,18 @@ def _qAB_fwd(
     O_ptrs = out_ptr + pid_b * stride_o_b + (pid_hg * stride_o_g + offs_qls[:, None]*stride_o_lq + offs_ls[None, :]*stride_o_lkv)
 
     # Fix BLOCK_SIZE_D = 64, and head_dim = 128
-    ab_0 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
-    ab_1 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
+    ab_0 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float16)
+    ab_1 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float16)
 
     for _ in tl.range(0, tl.cdiv(RANK, BLOCK_SIZE_R)):
-
+        b_0 = tl.load(B_ptrs)
         # Load next block of A, B
-        a = tl.load(A_ptrs, mask=offs_ls[:, None] < KV_LEN, other=0.0, eviction_policy="evict_first")
+        a = tl.load(A_ptrs, mask=offs_ls[:, None] < KV_LEN, other=0.0)
         # Accumulate along R dimension.
-        b_0 = tl.load(B_ptrs, eviction_policy="evict_last")
-        ab_0 = tl.dot(a, b_0, ab_0)
+        ab_0 = tl.dot(a, b_0, ab_0, out_dtype=tl.float16)
         
-        b_1 = tl.load(B_ptrs + BLOCK_SIZE_D * stride_B_d, eviction_policy="evict_last")
-        ab_1 = tl.dot(a, b_1, ab_1)
+        b_1 = tl.load(B_ptrs + BLOCK_SIZE_D * stride_B_d)
+        ab_1 = tl.dot(a, b_1, ab_1, out_dtype=tl.float16)
         
         # Advance the pointers to next blocks
         A_ptrs += BLOCK_SIZE_R * stride_A_r
@@ -71,14 +70,14 @@ def _qAB_fwd(
 
     start_block = pid_l * BLOCK_SIZE_L
     cos, sin = _sin_cos(starting_idx=start_block, theta=THETA, NB_TOKENS=BLOCK_SIZE_L)
-    #cos = cos.to(tl.float16)
-   # sin = sin.to(tl.float16)
+    cos = cos.to(tl.float16)
+    sin = sin.to(tl.float16)
     
     ab_0_pe = ab_0 * cos - ab_1 * sin
     ab_1_pe = ab_1 * cos + ab_0 * sin
 
-    ab_0_pe = ab_0_pe.to(tl.float16)
-    ab_1_pe = ab_1_pe.to(tl.float16)
+    #ab_0_pe = ab_0_pe.to(tl.float16)
+    #ab_1_pe = ab_1_pe.to(tl.float16)
 
     q1 = tl.load(Q_ptrs, mask=offs_qls[:, None] < Q_LEN, other=0.0)
     out_0 = tl.dot(q1, ab_0_pe.T).to(tl.float16)
