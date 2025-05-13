@@ -19,8 +19,8 @@ def mla_decode_attention_fwd(
     
     # Determine number of KV splits if not provided
     # FIXME(brian1009): Determine the optimal number of KV splits on the fly
-    num_kv_splits = torch.ones(batch, dtype=torch.int32, device=q.device) * 64
-    max_kv_splits = 64
+    num_kv_splits = torch.ones(batch, dtype=torch.int32, device=q.device) * 128
+    max_kv_splits = 128
 
     # Create intermediate tensors for attention computation
     attn_logits = torch.zeros(
@@ -83,8 +83,8 @@ def mla_decode_attention_fwd_pd_sep(
 
     # Handle prefill buffer
     ## FIXME(brian1009): Determine the optimal number of KV splits on the fly
-    num_kv_splits_prefill = torch.ones(batch, dtype=torch.int32, device=q.device) *64
-    max_kv_splits_prefill = 64
+    num_kv_splits_prefill = torch.ones(batch, dtype=torch.int32, device=q.device) * 128
+    max_kv_splits_prefill = 128
 
     max_kv_splits_decode = 2
     num_kv_splits_decode = torch.ones(batch, dtype=torch.int32, device=q.device) * 2
@@ -184,8 +184,9 @@ def mla_decode_attention_fwd_pd_sep_xKV(
     num_kv_splits_prefill = torch.ones(batch, dtype=torch.int32, device=q.device) * 128
     max_kv_splits_prefill = 128
 
-    max_kv_splits_decode = 2
-    num_kv_splits_decode = torch.ones(batch, dtype=torch.int32, device=q.device) * 2
+    max_kv_splits_decode = 4
+    num_kv_splits_decode = torch.ones(batch, dtype=torch.int32, device=q.device) * 4
+
     # Create intermediate tensors for attention computation
     attn_logits_prefill = torch.empty(
         (batch, num_q_heads, max_kv_splits_prefill, rank),
@@ -235,8 +236,6 @@ def mla_decode_attention_fwd_pd_sep_xKV(
         sm_scale,
         logit_cap,
     )
-
-    breakpoint()
 
     # Merge prefill and decode results
     attn_logits = torch.cat([attn_logits_prefill, attn_logits_decode], dim=2)

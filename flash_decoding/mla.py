@@ -402,10 +402,8 @@ def decode_attention_fwd(
     
     # Determine number of KV splits if not provided
     # FIXME(brian1009): Determine the optimal number of KV splits on the fly
-    num_kv_splits = torch.ones(batch, dtype=torch.int32, device=q.device) * 130
-    max_kv_splits = 130
-    #num_kv_splits = torch.ones(batch, dtype=torch.int32, device=q.device) * 1
-    #max_kv_splits = 1
+    num_kv_splits = torch.ones(batch, dtype=torch.int32, device=q.device) * 128
+    max_kv_splits = 128
 
     # Create intermediate tensors for attention computation
     attn_logits = torch.empty(
