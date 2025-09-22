@@ -97,3 +97,22 @@ def rotary_sin_cos(
         BLOCK_M=block_size,
     )
     return sin, cos
+
+
+# ---------------------------------------------------------------------------
+# Random sin/cos generator for quick tests
+# ---------------------------------------------------------------------------
+def rotary_sin_cos_randn(
+    seqlen: int,
+    *,
+    dim_2: int = 64,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str = "cuda",
+):
+    """
+    Return random sin, cos with shape (seqlen, dim_2) each.
+    Useful when you only need shapes and speed, not correctness vs. true ROPE.
+    """
+    sin = torch.randn((seqlen, dim_2), dtype=dtype, device=device)
+    cos = torch.randn_like(sin)
+    return sin, cos
