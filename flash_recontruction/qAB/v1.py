@@ -6,7 +6,7 @@ from flash_recontruction.rope.sin_cos import _sin_cos
 def get_configs():
     configs = []
     for block_l in [32, 64, 128]:
-        for block_r in [16, 32, 64, 128]:
+        for block_r in [16, 32, 64]:
             for num_warps in [2, 4, 8]:
                 for num_stages in [1, 2, 3, 4, 8]:
                     configs.append(

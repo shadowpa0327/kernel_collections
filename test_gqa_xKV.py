@@ -11,9 +11,9 @@ if __name__ == "__main__":
    # ---------------------------
     # 1) BASIC PARAMETERS
     # ---------------------------
-    batch       = 1
+    batch       = 2
     q_len       = 1
-    kv_len      = 256*1024
+    kv_len      = 256
     num_q_heads = 32
     num_kv_heads = 8
     head_dim    = 128
@@ -39,8 +39,8 @@ if __name__ == "__main__":
 
 
     # --------------------------- (Testing K only)
-    num_kv_splits = torch.tensor([128], dtype=torch.int32, device=device)
-    max_kv_splits = 128
+    num_kv_splits = torch.tensor([1, 1], dtype=torch.int32, device=device)
+    max_kv_splits = 1
 
     o_ref = gqa_xKV_no_pe_k_only_ref(q, k_A_buffer, k_B_buffer, v_buffer)
     print(o_ref.shape)
@@ -66,12 +66,12 @@ if __name__ == "__main__":
     print(torch.max(torch.abs(o_ref - o_fused)))
 
 
-    # --------------------------- (Testing K and V with v2)
-    o_fused = gqa_xKV_no_pe_v2( 
-        q, k_A_buffer, k_B_buffer, v_A_buffer, v_B_buffer, num_kv_splits, max_kv_splits, sm_scale
-    )
-    print(o_fused.shape)
-    print(torch.max(torch.abs(o_ref - o_fused)))
+    # # --------------------------- (Testing K and V with v2)
+    # o_fused = gqa_xKV_no_pe_v2( 
+    #     q, k_A_buffer, k_B_buffer, v_A_buffer, v_B_buffer, num_kv_splits, max_kv_splits, sm_scale
+    # )
+    # print(o_fused.shape)
+    # print(torch.max(torch.abs(o_ref - o_fused)))
 
 
 

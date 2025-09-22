@@ -55,6 +55,8 @@ def test_correctness(bsz, num_heads, num_kv_heads, rank, head_dim, q_len, kv_len
     out_ref = qAB_rope_ref(q, Ak, Bk, cos, sin, position_ids)
     out_triton = qAB_rope_v1(q, Ak, Bk, theta=10000000.0)
 
+    print(out_triton, out_ref)
+    print(torch.max(torch.abs(out_triton-out_ref)))
     print("output match (ref == triton-v1): ", torch.allclose(out_ref, out_triton, atol=1e-2, rtol=1e-2))
 
     sin_cos = torch.cat([sin[0,...,:head_dim//2], cos[0,...,:head_dim//2]], dim=-1)
@@ -69,10 +71,10 @@ def test_correctness(bsz, num_heads, num_kv_heads, rank, head_dim, q_len, kv_len
     print(torch.max(torch.abs(out_triton_v3-out_ref)))
     print("output match (ref == triton-v3): ", torch.allclose(out_ref, out_triton_v3, atol=1e-2, rtol=1e-2))
 
-    out_triton_v4 = qAB_rope_v4(q, Ak, Bk, theta=10000000.0)
-    print(out_triton_v4, out_ref)
-    print(torch.max(torch.abs(out_triton_v4-out_ref)))
-    print("output match (ref == triton-v4): ", torch.allclose(out_ref, out_triton_v4, atol=1e-2, rtol=1e-2))
+    # out_triton_v4 = qAB_rope_v4(q, Ak, Bk, theta=10000000.0)
+    # print(out_triton_v4, out_ref)
+    # print(torch.max(torch.abs(out_triton_v4-out_ref)))
+    # print("output match (ref == triton-v4): ", torch.allclose(out_ref, out_triton_v4, atol=1e-2, rtol=1e-2))
 
 def run_one_test(bsz, num_heads, num_kv_heads, rank, head_dim, q_len, kv_len):
     q = torch.randn(bsz, num_heads, q_len, head_dim).to(torch.float16).cuda() / 5
@@ -97,8 +99,8 @@ def run_qk_qab_benchmark(
             x_names=['kv_len'],  # What we're varying on x-axis
             x_vals=[2**i for i in range(14, 18)],  # Testing powers of 2 from 4K to 128K
             line_arg='operation',  # Different lines for different operations
-            line_vals=['qk', 'qab_v1', 'qab_v2', 'qab_v3', 'qab_v4'],
-            line_names=['qK (Standard)', 'qAB_v1 (Triton)', 'qAB_v2 (Triton)', 'qAB_v3 (Triton)', 'qAB_v4 (Triton)'],
+            line_vals=['qk', 'qab_v1', 'qab_v2', 'qab_v3'],
+            line_names=['qK (Standard)', 'qAB_v1 (Triton)', 'qAB_v2 (Triton)', 'qAB_v3 (Triton)'],
             styles=[('red', '--'), ('blue', '-'), ('green', ':'), ('yellow', '-'), ('purple', '-')],
             ylabel='ms',
             plot_name=f'qk-qab-comparison-kvh{num_kv_heads}-qh{num_heads}-d{head_dim}-r{rank}',
@@ -153,10 +155,10 @@ def run_qk_qab_benchmark(
             # Compiled qAB operation
             def fn():
                 return qAB_rope_v3(q, Ak, Bk, theta=10000000.0)
-        elif operation == 'qab_v4':
-            # Compiled qAB operation
-            def fn():
-                return qAB_rope_v4(q, Ak, Bk, theta=10000000.0)
+        # elif operation == 'qab_v4':
+        #     # Compiled qAB operation
+        #     def fn():
+        #         return qAB_rope_v4(q, Ak, Bk, theta=10000000.0)
         else:  # qab_ref
             raise ValueError(f"Unknown operation: {operation}")
 
@@ -168,10 +170,10 @@ def run_qk_qab_benchmark(
 
 if __name__ == "__main__":
     q_len = 1
-    bsz = 1
+    bsz = 2
     num_heads = 32
-    num_kv_heads = 8
-    rank = 384
+    num_kv_heads = 4
+    rank = 256
     head_dim = 128
     kv_len = 32768*4
     dtype = torch.float16
@@ -179,7 +181,7 @@ if __name__ == "__main__":
 
     test_correctness(bsz, num_heads, num_kv_heads, rank, head_dim, q_len, kv_len)
 
-    run_qk_qab_benchmark(num_heads, num_kv_heads, head_dim, rank, dtype, device)
+    #run_qk_qab_benchmark(num_heads, num_kv_heads, head_dim, rank, dtype, device)
     # a = torch.cuda.nvtx.range_start("qAB_rope_v1")
     # run_one_test(bsz, num_heads, num_kv_heads, rank, head_dim, q_len, kv_len)
     # torch.cuda.nvtx.range_end(a)

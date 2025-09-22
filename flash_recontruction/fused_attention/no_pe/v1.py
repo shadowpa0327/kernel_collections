@@ -120,7 +120,7 @@ def _fwd_grouped_kernel_stage1(
                     + offs_n[None, :] * stride_buf_kA_ls
                     + offs_r[:, None] + i * BLOCK_R
                 ) 
-                
+
                 kA = tl.load(
                     K_A_Buffer + offs_buf_kA, 
                     mask=(offs_n[None, :] < split_kv_end), 
@@ -143,7 +143,6 @@ def _fwd_grouped_kernel_stage1(
             qk = tl.where(
                 mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
             )
-
             offs_buf_v = (
                 cur_batch * stride_buf_vbs  
                 + offs_n[:, None] * stride_buf_vls
@@ -220,10 +219,8 @@ def _decode_grouped_att_m_fwd(
         triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
         MAX_KV_SPLITS,
     )
-
     extra_kargs = {}
     num_stages = 2
-
     _fwd_grouped_kernel_stage1[grid](
         q,
         k_A_buffer,

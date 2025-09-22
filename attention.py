@@ -89,7 +89,6 @@ def group_query_attention(query,
 
     return attn_output
 
-
 def group_query_attentionv2(query, 
                           key, 
                           value, 
@@ -355,7 +354,6 @@ def group_query_attention_factorized(
     attn_output = attn_output.view(bsz, num_heads, q_len, head_dim)
     
     return attn_output
-
 
 def group_query_attention_factorized_RoPE(
     query,                  # (bsz, num_heads, q_len, head_dim)
