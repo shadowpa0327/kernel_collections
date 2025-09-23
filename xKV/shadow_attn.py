@@ -1,3 +1,10 @@
+import json
+import os
+import socket
+import time
+import uuid
+import warnings
+
 from flash_attn import flash_attn_with_kvcache
 import torch
 from transformers import AutoConfig
@@ -6,6 +13,19 @@ from kv_cache_xkv import KV_Cache, ShadowKVCache_xKey_CPU, ShadowKVCache_xKV_CPU
 from tensor_op import apply_rotary_pos_emb_single
 from merge_configs import generate_consecutive_palu_config
 
+try:
+    from torch.cuda import nvtx
+except ImportError:  # pragma: no cover - NVTX is optional on some builds
+    class _NullNvtx:
+        @staticmethod
+        def range_push(_msg):
+            return None
+
+        @staticmethod
+        def range_pop():
+            return None
+
+    nvtx = _NullNvtx()
 
 def init_xkv_cache(
     *,
@@ -34,7 +54,7 @@ def init_xkv_cache(
         from types import SimpleNamespace
         config = SimpleNamespace(
             hidden_size=4096,
-            num_hidden_layers=32,
+            num_hidden_layers=4,
             num_attention_heads=32,
             num_key_value_heads=8,
         )
@@ -45,13 +65,13 @@ def init_xkv_cache(
             from types import SimpleNamespace
             config = SimpleNamespace(
                 hidden_size=4096,
-                num_hidden_layers=32,
+                num_hidden_layers=4,
                 num_attention_heads=32,
                 num_key_value_heads=8,
             )
 
     # Derive layer range from config when available
-    num_layers = getattr(config, "num_hidden_layers", 32)
+    num_layers = getattr(config, "num_hidden_layers", 4)
     merge_config = generate_consecutive_palu_config(
         start_layer=0,
         end_layer=num_layers - 1,
@@ -113,59 +133,179 @@ def init_xkv_cache(
     
     
 def xkv_attention(query_states, layer_idx, kv_cache: KV_Cache, cos_sin_cache=None):
-    # Branch: dense full cache vs xKey/xKV
+    """Run flash attention with either dense, xKey, or xKV cache."""
+    # Dense baseline path is short-circuited.
     if isinstance(kv_cache, KV_Cache):
-        # Use dense caches directly
         seqlen = kv_cache.get_kv_len() or kv_cache.max_length
         key_states = kv_cache.k_cache[layer_idx][:, :, :seqlen]
         value_states = kv_cache.v_cache[layer_idx][:, :, :seqlen]
-        # flash attention
-        hidden_states = flash_attn_with_kvcache(
+        return flash_attn_with_kvcache(
             q=query_states.transpose(1, 2),
             k_cache=key_states.transpose(1, 2),
             v_cache=value_states.transpose(1, 2),
             causal=True,
         )
-        return hidden_states
 
-    # get retrieval idx
+    if cos_sin_cache is None:
+        raise ValueError("cos_sin_cache must be provided for ShadowKV caches")
+
     nvtx.range_push("get_retrieval_position_ids")
-    position_ids = self.kv_cache.get_retrieval_position_ids(layer_idx=layer_idx, query_states=query_states)
-    nvtx.range_pop()  # get_retrieval_position_ids
-
-    # multi-stream
-    if not isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
-        curr_stream = torch.cuda.current_stream()
-        get_value_stream = self.kv_cache.copy_stream
-
-    if isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
-        nvtx.range_push("get_value_cache_xKV_cpu")
-        value_states = self.kv_cache.get_value_cache(layer_idx, position_ids, self.cos_sin_cache)
-        nvtx.range_pop()
-    else:
-        nvtx.range_push("get_value_cache_offload_stream")
-        with torch.cuda.stream(get_value_stream):
-            get_value_stream.wait_stream(curr_stream)
-            value_states = self.kv_cache.get_value_cache(layer_idx, position_ids)
-        nvtx.range_pop()
-
-    # gather key cache from GPU and RoPE it (should be hide by CPU offloading time)
-    if isinstance(self.kv_cache, ShadowKVCache_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKey_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
-        nvtx.range_push("get_key_cache")
-        key_states = self.kv_cache.get_key_cache(layer_idx=layer_idx, position_ids=position_ids, rope_func=self.apply_rotary_pos_emb_single, cos_sin_cache=self.cos_sin_cache)
-        nvtx.range_pop()
-    else:
-        key_states = self.kv_cache.get_key_cache(layer_idx=layer_idx, position_ids=position_ids, rope_func=self.apply_rotary_pos_emb_single)
-
-    if isinstance(self.kv_cache, ShadowKVCache_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKey_CPU):
-        nvtx.range_push("wait_get_value_stream")
-        curr_stream.wait_stream(get_value_stream)
-        nvtx.range_pop()
-
-    # flash attention
-    nvtx.range_push("flash_attn_with_kvcache")
-    hidden_states = flash_attn_with_kvcache(q=query_states.transpose(1, 2), k_cache=key_states.transpose(1, 2), v_cache=value_states.transpose(1, 2), causal=True)
+    position_ids = kv_cache.get_retrieval_position_ids(layer_idx=layer_idx, query_states=query_states)
     nvtx.range_pop()
+
+    # Default to synchronous gather; upgrade to async for offloaded caches.
+    curr_stream = None
+    value_stream = None
+
+    if isinstance(kv_cache, ShadowKVCache_xKV_CPU):
+        nvtx.range_push("get_value_cache_xKV_cpu")
+        value_states = kv_cache.get_value_cache(layer_idx, position_ids, cos_sin_cache)
+        nvtx.range_pop()
+    else:
+        curr_stream = torch.cuda.current_stream()
+        value_stream = kv_cache.copy_stream
+        nvtx.range_push("get_value_cache_offload_stream")
+        with torch.cuda.stream(value_stream):
+            value_stream.wait_stream(curr_stream)
+            value_states = kv_cache.get_value_cache(layer_idx, position_ids)
+        nvtx.range_pop()
+
+    nvtx.range_push("get_key_cache")
+    key_states = kv_cache.get_key_cache(
+        layer_idx=layer_idx,
+        position_ids=position_ids,
+        rope_func=apply_rotary_pos_emb_single,
+        cos_sin_cache=cos_sin_cache,
+    )
+    nvtx.range_pop()
+
+    if value_stream is not None:
+        nvtx.range_push("wait_get_value_stream")
+        curr_stream.wait_stream(value_stream)
+        nvtx.range_pop()
+
+    nvtx.range_push("flash_attn_with_kvcache")
+    hidden_states = flash_attn_with_kvcache(
+        q=query_states.transpose(1, 2),
+        k_cache=key_states.transpose(1, 2),
+        v_cache=value_states.transpose(1, 2),
+        causal=True,
+    )
+    nvtx.range_pop()
+
+    return hidden_states
+
+
+def _maybe_compile_attention(kv_cache, cos_sin_cache, layer_idx, *, compile_mode="reduce-overhead"):
+    """Return a callable that executes xkv_attention and is torch.compile'd when possible."""
+
+    def _decode(query_states):
+        return xkv_attention(query_states, layer_idx, kv_cache, cos_sin_cache)
+
+    #compile_fn = getattr(torch, "compile", None)
+    compile_fn = None
+    if compile_fn is None:
+        return _decode
+
+    try:
+        return compile_fn(_decode)
+    except Exception as exc:  # pragma: no cover - backend specific failures
+        warnings.warn(f"torch.compile failed for xkv_attention, falling back to eager execution: {exc}")
+        return _decode
+
+
+def _export_profiler_trace(prof, output_dir, *, file_prefix="xkv_attention", device="cuda:0", use_gzip=False):
+    os.makedirs(output_dir, exist_ok=True)
+    worker_name = f"{socket.gethostname()}_{os.getpid()}"
+    timestamp = time.time_ns()
+    trace_path = os.path.join(output_dir, f"{file_prefix}.{worker_name}.{timestamp}.pt.trace.json")
+    if use_gzip:
+        trace_path = trace_path + ".gz"
+    prof.export_chrome_trace(trace_path)
+    timeline_path = os.path.join(output_dir, f"{file_prefix}.{worker_name}.{timestamp}.html")
+    try:
+        prof.export_memory_timeline(timeline_path, device=device)
+    except Exception:
+        timeline_path = None
+    return {"trace_path": trace_path, "memory_timeline_path": timeline_path}
+
+
+@torch.inference_mode()
+def profile_xkv_attention(
+    *,
+    mode: str = "xkey",
+    group_size: int = 4,
+    rank_k: int = 256,
+    rank_v: int = 384,
+    sparse_budget: int = 2048,
+    max_length: int = 65536,
+    chunk_size: int = 8,
+    batch_size: int = 1,
+    model_name: str = "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    layer_idx: int = 0,
+    prefill_len: int = 65536,
+    warmup: int = 5,
+    iters: int = 5,
+    profile_dir: str = "torch_profile_output",
+    profile_prefix: str | None = None,
+    profiler_activities=None,
+    use_gzip: bool = False,
+):
+    from torch.profiler import ProfilerActivity, profile, record_function
+
+    kv_cache, config, _ = init_xkv_cache(
+        mode=mode,
+        group_size=group_size,
+        rank_k=rank_k,
+        rank_v=rank_v,
+        sparse_budget=sparse_budget,
+        max_length=max_length,
+        chunk_size=chunk_size,
+        batch_size=batch_size,
+        model_name=model_name,
+        prefill_len=prefill_len,
+        pre_init=True,
+    )
+
+    device = torch.device("cuda:0")
+    dtype = torch.bfloat16
+    head_dim = config.hidden_size // config.num_attention_heads
+    num_heads = config.num_attention_heads
+
+    torch.cuda.set_device(device)
+
+    cos_sin_cache = torch.randn((max_length, head_dim), device=device, dtype=dtype)
+    q = torch.randn(batch_size, num_heads, 1, head_dim, device=device, dtype=dtype)
+
+    decode_fn = _maybe_compile_attention(kv_cache, cos_sin_cache, layer_idx)
+
+    activities = profiler_activities or [ProfilerActivity.CPU]
+    if all(act is not ProfilerActivity.CUDA for act in activities):
+        activities.append(ProfilerActivity.CUDA)
+
+    for _ in range(max(warmup, 0)):
+        decode_fn(q)
+    torch.cuda.synchronize(device)
+
+    with profile(
+        activities=activities,
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+        with_flops=True,
+    ) as prof:
+        for _ in range(max(iters, 1)):
+            with record_function("xkv_attention"):
+                decode_fn(q)
+            torch.cuda.synchronize(device)
+
+    return _export_profiler_trace(
+        prof,
+        output_dir=profile_dir,
+        file_prefix=profile_prefix or f"{mode}_{uuid.uuid4().hex[:8]}",
+        device=str(device),
+        use_gzip=use_gzip,
+    )
 
 
 @torch.inference_mode()
@@ -342,11 +482,13 @@ def benchmark_xkv_attention(
     # Prepare a decode query (q_len=1)
     q = torch.randn(batch_size, num_heads, 1, head_dim, device=device, dtype=dtype)
 
+    decode_fn = _maybe_compile_attention(kv_cache, cos_sin_cache, layer_idx)
+
     # xkv_attention = torch.compile(xkv_attention)
 
     # Warmup
     for _ in range(max(warmup, 0)):
-        _ = xkv_attention(q, layer_idx, kv_cache, cos_sin_cache)
+        _ = decode_fn(q)
     torch.cuda.synchronize()
 
     # Timed runs
@@ -354,19 +496,8 @@ def benchmark_xkv_attention(
     for _ in range(max(iters, 1)):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        # from torch.profiler import profile, record_function, ProfilerActivity
-        # with profile(
-        #     activities=[
-        #         ProfilerActivity.CPU,
-        #         ProfilerActivity.CUDA,
-        #     ],
-        #     record_shapes=True,
-        #     profile_memory=True,
-        #     with_stack=True,
-        #     with_flops=True,
-        # ) as prof:
-        xkv_attention(q, layer_idx, kv_cache, cos_sin_cache)
+        start.record() 
+        decode_fn(q)
         end.record()
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end))
@@ -405,30 +536,50 @@ if __name__ == "__main__":
     parser.add_argument("--rank_k", type=int, default=64)
     parser.add_argument("--rank_v", type=int, default=96)
     parser.add_argument("--sparse_budget", type=int, default=2048)
-    parser.add_argument("--max_length", type=int, default=65536)
+    parser.add_argument("--max_length", type=int, default=131072)
     parser.add_argument("--chunk_size", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--model_name", type=str, default="local")
     parser.add_argument("--layer_idx", type=int, default=0)
-    parser.add_argument("--prefill_len", type=int, default=61440)
+    parser.add_argument("--prefill_len", type=int, default=131072)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument("--profile", action="store_true", help="Use torch.profiler instead of timing loop")
+    parser.add_argument("--profile_dir", type=str, default="torch_profile_output", help="Directory to store profiler traces")
     args = parser.parse_args()
 
-    res = benchmark_xkv_attention(
-        mode=args.mode,
-        group_size=args.group_size,
-        rank_k=args.rank_k,
-        rank_v=args.rank_v,
-        sparse_budget=args.sparse_budget,
-        max_length=args.max_length,
-        chunk_size=args.chunk_size,
-        batch_size=args.batch_size,
-        model_name=args.model_name,
-        layer_idx=args.layer_idx,
-        prefill_len=args.prefill_len,
-        warmup=args.warmup,
-        iters=args.iters,
-    )
-    print(json.dumps(res, ensure_ascii=False))
-
+    if args.profile:
+        profile_paths = profile_xkv_attention(
+            mode=args.mode,
+            group_size=args.group_size,
+            rank_k=args.rank_k,
+            rank_v=args.rank_v,
+            sparse_budget=args.sparse_budget,
+            max_length=args.max_length,
+            chunk_size=args.chunk_size,
+            batch_size=args.batch_size,
+            model_name=args.model_name,
+            layer_idx=args.layer_idx,
+            prefill_len=args.prefill_len,
+            warmup=args.warmup,
+            iters=args.iters,
+            profile_dir=args.profile_dir,
+        )
+        print(json.dumps({"profile": profile_paths}, ensure_ascii=False))
+    else:
+        res = benchmark_xkv_attention(
+            mode=args.mode,
+            group_size=args.group_size,
+            rank_k=args.rank_k,
+            rank_v=args.rank_v,
+            sparse_budget=args.sparse_budget,
+            max_length=args.max_length,
+            chunk_size=args.chunk_size,
+            batch_size=args.batch_size,
+            model_name=args.model_name,
+            layer_idx=args.layer_idx,
+            prefill_len=args.prefill_len,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        print(json.dumps(res, ensure_ascii=False))

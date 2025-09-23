@@ -162,4 +162,3 @@ def batch_gather_gemm_rotary_pos_emb_cuda(
 def sample(probs : torch.Tensor, num_samples=1):
     idx_next = torch.multinomial(probs, num_samples=num_samples, replacement=True)
     return idx_next
-

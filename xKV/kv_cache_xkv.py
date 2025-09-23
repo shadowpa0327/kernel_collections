@@ -307,7 +307,6 @@ class ShadowKVCache_xKey_CPU:
         # print(f"avg cnts: {self.cnts.float().mean()} hit rate: {self.cnts.float().mean() / (self.sparse_budget / 8.0) * 100:.2f}%")
         shadowkv.gather_copy_d2d_with_offsets(self.k_cache_buffer[layer_idx], self.offsets, self.cnts, self.batch_size, self.num_key_value_heads, int(self.sparse_budget*self.head_dim), self.kernel_offset, self.kernel_stride, self.select_sets)
         batch_gather_gemm_rotary_pos_emb_cuda(u, sv, cos_sin_cache, position_ids, self.output, self.chunk_size, self.k_cache_buffer[layer_idx], self.sparse_start, self.sparse_end, self.cnts)
-
         gen_offset = self.gen_offset if layer_idx == self.num_layers - 1 else self.gen_offset + self.incoming_q_len
 
         return self.k_cache_buffer[layer_idx][:, :, :self.sparse_end + gen_offset]
@@ -463,7 +462,7 @@ class ShadowKVCache_xKV_CPU:
         self.offsets = torch.zeros(
             self.block_num * (sparse_budget // chunk_size), device=self.device, dtype=torch.int32
         ).contiguous()
-        self.cnts = torch.zeros(self.block_num, device=self.device, dtype=torch.int32).contiguous().fill_(200)
+        self.cnts = torch.zeros(self.block_num, device=self.device, dtype=torch.int32).contiguous().fill_(150)
         self.signals = torch.zeros(self.block_num, device=self.device, dtype=torch.int32).contiguous()
         self.position_ids = torch.empty(
             self.num_layers,
@@ -521,7 +520,8 @@ class ShadowKVCache_xKV_CPU:
         # use merged_results to gather the position_ids: [bsz, 8, chunks] --> [bsz, 8, select_sets]
         selected_chunks = self.k_landmark_idx[layer_idx].gather(dim=-1, index=merged_results) # [bsz, 8, select_sets]
         shadowkv.reorder_keys_and_compute_offsets(self.position_ids[layer_idx], selected_chunks, self.offsets, self.cnts, self.batch_size, self.num_key_value_heads, self.select_sets)
-
+        #print(self.cnts)
+        self.cnts.fill_(0)
         return self.position_ids[layer_idx]
 
     def get_value_cache(self, layer_idx, position_ids, cos_sin_cache):
