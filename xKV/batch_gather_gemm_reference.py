@@ -62,7 +62,8 @@ def batch_gather_gemm_reference(
     cos_sin,        # [max_seq_len, head_dim] - RoPE cache (cos and sin are same in kernel)
     position_ids,   # [batch_size, heads, num_chunks] - int32, indices for gathering
     chunk_size,     # int - size of each chunk
-    apply_rope=True # whether to apply RoPE
+    apply_rope=True, # whether to apply RoPE
+    cnts=None       # [batch_size * heads] - number of chunks to skip per batch-head
 ):
     """
     Reference implementation of batch_gather_gemm.
@@ -167,9 +168,40 @@ def batch_gather_gemm_reference(
     print(f"  b_transposed: {list(b_transposed.shape)}")
     print(f"  output (before RoPE): {list(output.shape)}\n")
 
+    # Step 3.5: Apply cnts filtering if provided
+    if cnts is not None:
+        print(f"Step 3.5: Apply cnts filtering")
+        print(f"  cnts shape: {list(cnts.shape)}")
+
+        # Create a mask for which chunks should be processed
+        # cnts: [batch_size * heads]
+        # For each (batch, head), skip chunks with index < cnts[b*heads + h]
+
+        # Reshape output for per-chunk masking: [batch_size, heads, num_chunks, chunk_size, head_dim]
+        output_reshaped = output.reshape(batch_size, heads, num_chunks, chunk_size, head_dim)
+
+        # Create chunk indices: [num_chunks]
+        chunk_indices = torch.arange(num_chunks, device=output.device)
+
+        # For each batch-head, create a mask
+        for b in range(batch_size):
+            for h in range(heads):
+                cnt = cnts[b * heads + h].item()
+                # Chunks with index < cnt should be zeroed out
+                output_reshaped[b, h, :cnt, :, :] = 0
+
+        # Reshape back to [batch_size, heads, sparse_budget, head_dim]
+        output = output_reshaped.reshape(batch_size, heads, sparse_budget, head_dim)
+
+        print(f"  Zeroed out chunks < cnts for each batch-head")
+        print(f"  Example: batch=0, head=0, cnt={cnts[0].item()}, zeroed chunks 0-{cnts[0].item()-1 if cnts[0].item() > 0 else 'none'}\n")
+
     # Step 4: (Optional) Apply RoPE
     if apply_rope:
         # Apply RoPE using the gathered position indices
+        # Note: In the CUDA kernel, RoPE is also skipped for chunks < cnt
+        # But we apply it to all non-zero chunks for simplicity in reference
+        # The CUDA kernel filters in the RoPE kernel itself
         output = apply_rotary_pos_emb_reference(output, cos_sin, position_ids_full)
         print(f"Step 4: Apply RoPE")
         print(f"  output (after RoPE): {list(output.shape)}\n")

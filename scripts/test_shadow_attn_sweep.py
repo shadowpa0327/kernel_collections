@@ -72,7 +72,7 @@ def run_shadow_attn_benchmark(mode, model_name, rank_k, rank_v, batch_size, pref
 def main():
     # Test all three configurations for comparison
     test_configs = [
-        {"mode": "xkv", "rank_k": 384, "rank_v": 576, "name": "xkv_k384_v512"},
+        {"mode": "xkv", "rank_k": 384, "rank_v": 576, "name": "xkv_k384_v576"},
         {"mode": "xkey", "rank_k": 256, "rank_v": None, "name": "xkey_k256"},
         {"mode": "full", "rank_k": None, "rank_v": None, "name": "full"}
     ]
@@ -81,7 +81,7 @@ def main():
     
     # Parameter sweeps
     batch_sizes = [4]
-    prefill_lens = [32*1024, 160*1024]
+    prefill_lens = [32*1024, 64*1024, 128*1024]
     
     # Benchmark settings
     warmup = 10
