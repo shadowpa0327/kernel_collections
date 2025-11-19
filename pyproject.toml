@@ -1,0 +1,40 @@
+[build-system]
+requires = [
+    "setuptools>=42",
+    "wheel",
+    "torch==2.6.0",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xkv"
+version = "0.1.0"
+description = "ShadowKV: Custom CUDA kernels for efficient KV cache operations"
+requires-python = ">=3.9"
+dependencies = [
+    "torch==2.6.0",
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "pandas",
+    "matplotlib",
+    "seaborn",
+    "pillow",
+    "jupyterlab",
+    "notebook",
+    "ipywidgets",
+    "tqdm",
+    "scikit-image",
+    "pydantic",
+    "joblib",
+    "transformers",
+    "datasets",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "triton",
+    "ninja",
+]
+
